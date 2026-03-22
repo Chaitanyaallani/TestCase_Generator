@@ -1,0 +1,7 @@
+streamlit
+groq
+pytesseract
+Pillow
+chromadb
+sentence-transformers
+openpyxl
