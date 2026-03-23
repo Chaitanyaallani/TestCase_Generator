@@ -143,12 +143,13 @@ def load_chroma():
 # HELPER FUNCTIONS
 # ══════════════════════════════════════════════════════════════════════════════
 
-def call_groq(prompt: str, api_key: str, max_tokens: int = 2000) -> str:
+def call_groq(prompt: str, api_key: str, max_tokens: int = 4000) -> str:
     client   = Groq(api_key=api_key)
     response = client.chat.completions.create(
-        model      = "llama-3.1-8b-instant",
-        messages   = [{"role": "user", "content": prompt}],
-        max_tokens = max_tokens
+        model       = "llama-3.3-70b-versatile",
+        messages    = [{"role": "user", "content": prompt}],
+        max_tokens  = max_tokens,
+        temperature = 0.3,
     )
     return response.choices[0].message.content
 
@@ -162,7 +163,7 @@ def run_ocr(image: Image.Image) -> str:
 def load_excel_to_rag(excel_bytes: bytes) -> int:
     """
     Load Excel into ChromaDB AND save docs to session_state as backup.
-    This ensures RAG data survives Streamlit reruns.
+    Only indexes rows that have meaningful Test Steps and Expected Result content.
     """
     embed_model         = load_embed_model()
     _, collection       = load_chroma()
@@ -177,18 +178,34 @@ def load_excel_to_rag(excel_bytes: bytes) -> int:
             continue
 
         headers = [
-            str(c.value).strip().lower() if c.value else f"col{i}"
+            str(c.value).strip() if c.value else f"col{i}"
             for i, c in enumerate(ws[1])
         ]
+        # Build lowercase header → index map for smart column lookup
+        header_map = {h.lower(): i for i, h in enumerate(headers)}
+
+        steps_idx    = header_map.get("test steps",      header_map.get("steps", -1))
+        expected_idx = header_map.get("expected result", header_map.get("expected", -1))
+        title_idx    = header_map.get("title",           0)
 
         for row in ws.iter_rows(min_row=2, values_only=True):
             if not any(row):
                 continue
-            row_text = "\n".join(
-                f"{headers[i]}: {v}"
-                for i, v in enumerate(row)
-                if v is not None and i < len(headers)
-            )
+
+            # Skip rows where both Test Steps AND Expected Result are empty
+            steps_val    = row[steps_idx]    if steps_idx    >= 0 and steps_idx    < len(row) else None
+            expected_val = row[expected_idx] if expected_idx >= 0 and expected_idx < len(row) else None
+
+            if not steps_val and not expected_val:
+                continue  # This row has no useful content for RAG
+
+            # Build a rich structured doc string
+            parts = []
+            for i, v in enumerate(row):
+                if v is not None and i < len(headers):
+                    parts.append(f"{headers[i]}: {v}")
+            row_text = "\n".join(parts)
+
             if not row_text.strip():
                 continue
 
@@ -205,8 +222,8 @@ def load_excel_to_rag(excel_bytes: bytes) -> int:
                 pass
 
     # Save docs to session state as backup
-    st.session_state.rag_docs  = all_docs
-    st.session_state.rag_count = total
+    st.session_state.rag_docs   = all_docs
+    st.session_state.rag_count  = total
     st.session_state.rag_loaded = True
     return total
 
@@ -259,7 +276,7 @@ def build_excel(test_cases_text: str, feature_name: str) -> bytes:
     bdr     = Border(left=thin, right=thin, top=thin, bottom=thin)
 
     headers = ["TC ID", "Title", "Preconditions", "Test Steps", "Expected Result", "Priority", "Status"]
-    widths  = [10, 28, 25, 40, 32, 12, 12]
+    widths  = [10, 28, 30, 50, 38, 12, 12]
 
     for c, (h, w) in enumerate(zip(headers, widths), 1):
         cell           = ws.cell(row=1, column=c, value=h)
@@ -270,16 +287,36 @@ def build_excel(test_cases_text: str, feature_name: str) -> bytes:
         ws.column_dimensions[get_column_letter(c)].width = w
     ws.row_dimensions[1].height = 30
 
-    lines = [
-        l.strip() for l in test_cases_text.split("\n")
-        if "|" in l and "---" not in l and l.strip() != "|"
-    ]
-    for ri, line in enumerate(lines, 2):
+    valid_rows = []
+    for line in test_cases_text.split("\n"):
+        line = line.strip()
+        if not line or "---" in line or not line.startswith("|"):
+            continue
         parts = [p.strip() for p in line.strip("|").split("|")]
+        # Must have at least 6 columns and key columns must not be blank
+        if len(parts) < 6:
+            continue
+        tc_id    = parts[0] if len(parts) > 0 else ""
+        title    = parts[1] if len(parts) > 1 else ""
+        steps    = parts[3] if len(parts) > 3 else ""
+        expected = parts[4] if len(parts) > 4 else ""
+        # Skip header-like rows and rows missing critical data
+        if tc_id.lower() in ("tc id", "id", "") or title.lower() in ("title", ""):
+            continue
+        if not steps or not expected:
+            continue
+        # Pad to 7 columns
         while len(parts) < 7:
             parts.append("")
+        # Ensure Status is set
         if not parts[6]:
             parts[6] = "Not Run"
+        # Ensure Priority is set
+        if not parts[5] or parts[5].lower() not in ("high", "medium", "low"):
+            parts[5] = "Medium"
+        valid_rows.append(parts)
+
+    for ri, parts in enumerate(valid_rows, 2):
         for ci, val in enumerate(parts[:7], 1):
             cell           = ws.cell(row=ri, column=ci, value=val)
             cell.font      = n_font
@@ -287,7 +324,7 @@ def build_excel(test_cases_text: str, feature_name: str) -> bytes:
             cell.alignment = c_align if ci in [1, 6, 7] else l_align
             if ri % 2 == 0:
                 cell.fill = a_fill
-        ws.row_dimensions[ri].height = 45
+        ws.row_dimensions[ri].height = 60
 
     ws2 = wb.create_sheet("Summary")
     for i, (k, v) in enumerate([
@@ -528,48 +565,74 @@ Feature Story:
 Requirements:
 {parsed}
 
-Reference style — follow this EXACT format from past test cases:
+Reference past test cases for naming style and domain context:
 {similar}
 
-Rules:
-- Each test MUST have exactly 5 numbered steps
-- Format: 1. Navigate to...; 2. Open/Select...; 3. Enter/Click...; 4. Submit...; 5. Verify...
-- Return ONLY pipe-delimited rows. No headings. No extra text.
+STRICT OUTPUT FORMAT — each row must have EXACTLY 7 pipe-separated columns:
+| TC ID | Title | Preconditions | Test Steps | Expected Result | Priority | Status |
 
-| TC001 | Title | Preconditions | 1. Step; 2. Step; 3. Step; 4. Step; 5. Step | Expected result | High |
+RULES (violations will break the system — follow exactly):
+1. Output ONLY pipe-delimited data rows. No headers, no markdown, no commentary.
+2. Test Steps column: write 5 steps separated by semicolons, numbered like:
+   1. [Navigate/Open the feature]; 2. [Locate the relevant UI element]; 3. [Perform the user action with valid data]; 4. [Submit or confirm the action]; 5. [Observe the result on screen]
+3. Expected Result: Write a complete sentence describing what the system should do, e.g. "System saves the record and displays a success message."
+4. Priority: must be one of High / Medium / Low
+5. Status: always "Not Run"
+6. Preconditions: describe what must be true before the test starts.
+7. TC IDs must start from TC001 and be sequential.
+
+EXAMPLE ROW (copy this pattern exactly):
+| TC001 | Verify valid year format is accepted | User is logged in; feature page is accessible | 1. Open the application and navigate to the feature; 2. Locate the year input field; 3. Enter a valid year in the correct format (e.g. 2024); 4. Click Save or Submit; 5. Observe the confirmation message | System accepts the input and saves the record successfully. A success confirmation is displayed. | High | Not Run |
 
 Generate exactly {pos} rows starting TC001.
 """
-            batch1 = call_groq(prompt1, api_key, max_tokens=2000)
+            batch1 = call_groq(prompt1, api_key, max_tokens=3000)
 
         if neg > 0 or edge > 0:
             with st.spinner(f"⚙️ Generating negative and edge test cases..."):
                 start_num = pos + 1
                 prompt2   = f"""You are a senior QA engineer.
-Generate {neg} NEGATIVE and {edge} EDGE test cases.
+Generate {neg} NEGATIVE test cases and {edge} EDGE CASE test cases.
 
 Requirements:
 {parsed}
 
-NEGATIVE: invalid inputs, unauthorized access, service unavailable, corrupted data.
-EDGE: empty fields, boundary values, special chars, leap year, timezone, large datasets.
+NEGATIVE scenarios to cover: empty required fields, invalid data types, special characters, unauthorized access, service/database unavailable, corrupted or missing data.
+EDGE scenarios to cover: boundary values (min/max), leap year dates, large datasets, timezone differences, very long strings, concurrent user actions.
 
-Rules:
-- Each test MUST have exactly 5 numbered steps
-- Return ONLY pipe-delimited rows. No headings. No extra text.
+STRICT OUTPUT FORMAT — each row must have EXACTLY 7 pipe-separated columns:
+| TC ID | Title | Preconditions | Test Steps | Expected Result | Priority | Status |
 
-| TC{start_num:03d} | Title | Preconditions | 1. Step; 2. Step; 3. Step; 4. Step; 5. Step | Expected | Medium |
+RULES (violations will break the system — follow exactly):
+1. Output ONLY pipe-delimited data rows. No headers, no markdown, no commentary.
+2. Test Steps column: write 5 steps separated by semicolons, numbered like:
+   1. [Navigate/Open the feature]; 2. [Locate the relevant UI element]; 3. [Enter invalid/edge-case input]; 4. [Submit or attempt the action]; 5. [Observe the error or edge behavior]
+3. Expected Result: Write a complete sentence describing what the system should do, e.g. "System displays an error message 'Invalid year format' and does not save the record."
+4. Priority: must be one of High / Medium / Low
+5. Status: always "Not Run"
+6. TC IDs must start from TC{start_num:03d} and be sequential.
+
+EXAMPLE NEGATIVE ROW:
+| TC{start_num:03d} | Verify error on empty year field | User is on the feature page and the year field is visible | 1. Open the application and navigate to the feature; 2. Locate the year input field; 3. Leave the year field completely empty; 4. Click Save or Submit; 5. Observe the validation message | System displays a validation error 'Year is required' and does not save the record. The field is highlighted in red. | High | Not Run |
 
 Generate exactly {neg + edge} rows starting TC{start_num:03d}.
 """
-                batch2     = call_groq(prompt2, api_key, max_tokens=2000)
+                batch2     = call_groq(prompt2, api_key, max_tokens=3000)
                 test_cases = batch1 + "\n" + batch2
         else:
             test_cases = batch1
 
         st.session_state.test_cases = test_cases
-        lines = [l for l in test_cases.split("\n") if "|" in l and "---" not in l]
-        st.session_state.tc_count   = len(lines)
+        # Count only valid data rows (has TC ID pattern and enough columns)
+        valid_lines = []
+        for l in test_cases.split("\n"):
+            l = l.strip()
+            if not l or "---" in l or not l.startswith("|"):
+                continue
+            parts = [p.strip() for p in l.strip("|").split("|")]
+            if len(parts) >= 6 and parts[0].lower() not in ("tc id", "id", "") and parts[3] and parts[4]:
+                valid_lines.append(l)
+        st.session_state.tc_count = len(valid_lines)
 
         # ── Stage 5: Excel Export ─────────────────────────────
         st.session_state.stage = 5
