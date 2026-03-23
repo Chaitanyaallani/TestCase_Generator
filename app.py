@@ -65,6 +65,16 @@ st.markdown("""
     border-radius: 8px; padding: 1.2rem 1.5rem; margin: 1rem 0;
     color: #1B5E20; font-weight: 500;
 }
+.rag-status-loaded {
+    background: #E8F5E9; border: 1px solid #A5D6A7; border-left: 3px solid #2E7D32;
+    border-radius: 6px; padding: 0.6rem 0.8rem; font-size: 0.8rem;
+    color: #1B5E20; margin-top: 0.5rem;
+}
+.rag-status-empty {
+    background: #FFF3CD; border: 1px solid #FFD580; border-left: 3px solid #F59E0B;
+    border-radius: 6px; padding: 0.6rem 0.8rem; font-size: 0.8rem;
+    color: #92400E; margin-top: 0.5rem;
+}
 .stButton > button {
     background: #1A1A2E !important; color: #E8F4FD !important;
     border: none !important; border-radius: 8px !important;
@@ -90,13 +100,43 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ── Session State ──────────────────────────────────────────────────────────────
-for k in ["extracted_text", "parsed_req", "similar_cases",
-          "test_cases", "excel_bytes", "stage", "tc_count"]:
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SESSION STATE INIT
+# KEY FIX: rag_loaded flag ensures Excel is never re-processed on rerun
+# ══════════════════════════════════════════════════════════════════════════════
+defaults = {
+    "extracted_text"  : None,
+    "parsed_req"      : None,
+    "similar_cases"   : None,
+    "test_cases"      : None,
+    "excel_bytes"     : None,
+    "stage"           : 0,
+    "tc_count"        : 0,
+    "rag_loaded"      : False,   # True once Excel is loaded into ChromaDB
+    "rag_count"       : 0,       # How many test cases are in ChromaDB
+    "rag_docs"        : [],      # Stores all docs in memory as backup
+}
+for k, v in defaults.items():
     if k not in st.session_state:
-        st.session_state[k] = None
-if st.session_state.stage is None:
-    st.session_state.stage = 0
+        st.session_state[k] = v
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CACHED RESOURCES — loaded once, never reloaded
+# ══════════════════════════════════════════════════════════════════════════════
+
+@st.cache_resource(show_spinner="Loading AI model...")
+def load_embed_model():
+    """Load embedding model once and cache it permanently."""
+    return SentenceTransformer("paraphrase-MiniLM-L3-v2")
+
+@st.cache_resource(show_spinner="Setting up database...")
+def load_chroma():
+    """Create ChromaDB client once and cache it permanently."""
+    client     = chromadb.Client()
+    collection = client.get_or_create_collection("all_test_cases")
+    return client, collection
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -119,28 +159,28 @@ def run_ocr(image: Image.Image) -> str:
     ).strip()
 
 
-@st.cache_resource(show_spinner="Loading AI model — please wait...")
-def get_rag():
-    # Use smaller faster model — 3x faster than all-MiniLM-L6-v2
-    embed = SentenceTransformer("paraphrase-MiniLM-L3-v2")
-    db    = chromadb.Client()
-    col   = db.get_or_create_collection("all_test_cases")
-    return embed, col
-
-
 def load_excel_to_rag(excel_bytes: bytes) -> int:
-    embed, col = get_rag()
-    wb         = openpyxl.load_workbook(io.BytesIO(excel_bytes))
-    total      = 0
+    """
+    Load Excel into ChromaDB AND save docs to session_state as backup.
+    This ensures RAG data survives Streamlit reruns.
+    """
+    embed_model         = load_embed_model()
+    _, collection       = load_chroma()
+    all_docs            = []
+    total               = 0
+
+    wb = openpyxl.load_workbook(io.BytesIO(excel_bytes))
 
     for sheet_name in wb.sheetnames:
         ws = wb[sheet_name]
         if ws.max_row < 3:
             continue
+
         headers = [
             str(c.value).strip().lower() if c.value else f"col{i}"
             for i, c in enumerate(ws[1])
         ]
+
         for row in ws.iter_rows(min_row=2, values_only=True):
             if not any(row):
                 continue
@@ -151,9 +191,11 @@ def load_excel_to_rag(excel_bytes: bytes) -> int:
             )
             if not row_text.strip():
                 continue
-            emb = embed.encode(row_text).tolist()
+
+            all_docs.append(row_text)
+            emb = embed_model.encode(row_text).tolist()
             try:
-                col.add(
+                collection.add(
                     documents  = [row_text],
                     embeddings = [emb],
                     ids        = [f"tc_{sheet_name}_{total}"]
@@ -161,16 +203,44 @@ def load_excel_to_rag(excel_bytes: bytes) -> int:
                 total += 1
             except Exception:
                 pass
+
+    # Save docs to session state as backup
+    st.session_state.rag_docs  = all_docs
+    st.session_state.rag_count = total
+    st.session_state.rag_loaded = True
     return total
 
 
 def rag_retrieve(query: str) -> str:
-    embed, col = get_rag()
-    if col.count() == 0:
+    """
+    Retrieve similar test cases.
+    First tries ChromaDB, falls back to session_state docs if ChromaDB is empty.
+    """
+    embed_model   = load_embed_model()
+    _, collection = load_chroma()
+
+    # If ChromaDB got reset but we have docs in session_state, reload them
+    if collection.count() == 0 and st.session_state.rag_docs:
+        for i, doc in enumerate(st.session_state.rag_docs):
+            emb = embed_model.encode(doc).tolist()
+            try:
+                collection.add(
+                    documents  = [doc],
+                    embeddings = [emb],
+                    ids        = [f"tc_restored_{i}"]
+                )
+            except Exception:
+                pass
+
+    if collection.count() == 0:
         return "No past test cases loaded."
-    emb     = embed.encode(query).tolist()
-    results = col.query(query_embeddings=[emb], n_results=min(5, col.count()))
-    docs    = results["documents"][0] if results["documents"] else []
+
+    emb     = embed_model.encode(query).tolist()
+    results = collection.query(
+        query_embeddings = [emb],
+        n_results        = min(5, collection.count())
+    )
+    docs = results["documents"][0] if results["documents"] else []
     return "\n\n---\n\n".join(docs) if docs else "No similar cases found."
 
 
@@ -221,10 +291,10 @@ def build_excel(test_cases_text: str, feature_name: str) -> bytes:
 
     ws2 = wb.create_sheet("Summary")
     for i, (k, v) in enumerate([
-        ("Feature", feature_name),
-        ("Total TCs", f"=COUNTA('Test Cases'!A2:A1000)"),
+        ("Feature",      feature_name),
+        ("Total TCs",    f"=COUNTA('Test Cases'!A2:A1000)"),
         ("Generated By", "AI Test Case Generator"),
-        ("Model", "Groq LLaMA 3.1"),
+        ("Model",        "Groq LLaMA 3.1"),
     ], 1):
         ws2.cell(row=i, column=1, value=k).font = Font(bold=True, name="Calibri")
         ws2.cell(row=i, column=2, value=v)
@@ -256,9 +326,9 @@ st.markdown("""
 # ── Sidebar ─────────────────────────────────────────────────────────────────────
 with st.sidebar:
 
+    # API Key
     st.markdown('<div class="sidebar-section">', unsafe_allow_html=True)
     st.markdown('<div class="sidebar-title">🔑 Groq API Key</div>', unsafe_allow_html=True)
-    # FIX 1: Added non-empty label, hidden with label_visibility
     api_key = st.text_input(
         "Groq API Key",
         type="password",
@@ -268,21 +338,56 @@ with st.sidebar:
     st.caption("Free key → [console.groq.com](https://console.groq.com)")
     st.markdown('</div>', unsafe_allow_html=True)
 
+    # RAG Upload — KEY FIX: only loads if not already loaded
     st.markdown('<div class="sidebar-section">', unsafe_allow_html=True)
     st.markdown('<div class="sidebar-title">📊 Past Test Cases (RAG)</div>', unsafe_allow_html=True)
     st.caption("Upload your master Excel file — works for ALL features")
-    # FIX 2: Added non-empty label, hidden with label_visibility
+
     past_excel = st.file_uploader(
         "Upload past test cases Excel",
         type=["xlsx", "xls"],
         label_visibility="hidden"
     )
-    if past_excel:
+
+    if past_excel and not st.session_state.rag_loaded:
+        # Only loads ONCE — never reloads on rerun
         with st.spinner("Loading test cases into RAG..."):
             count = load_excel_to_rag(past_excel.read())
         st.success(f"✅ {count} test cases loaded")
+
+    elif past_excel and st.session_state.rag_loaded:
+        # Already loaded — show status without reloading
+        st.markdown(
+            f'<div class="rag-status-loaded">'
+            f'✅ {st.session_state.rag_count} test cases already in RAG — ready to use'
+            f'</div>',
+            unsafe_allow_html=True
+        )
+
+    else:
+        st.markdown(
+            '<div class="rag-status-empty">'
+            '⚠️ No past test cases uploaded yet. Upload Excel for better results.'
+            '</div>',
+            unsafe_allow_html=True
+        )
+
+    # Clear RAG button
+    if st.session_state.rag_loaded:
+        if st.button("🗑️ Clear RAG & Upload New File"):
+            st.session_state.rag_loaded = False
+            st.session_state.rag_count  = 0
+            st.session_state.rag_docs   = []
+            _, col = load_chroma()
+            try:
+                col.delete(where={"id": {"$ne": ""}})
+            except Exception:
+                pass
+            st.rerun()
+
     st.markdown('</div>', unsafe_allow_html=True)
 
+    # Settings
     st.markdown('<div class="sidebar-section">', unsafe_allow_html=True)
     st.markdown('<div class="sidebar-title">🎛️ Settings</div>', unsafe_allow_html=True)
     num_cases    = st.slider("Number of test cases", 5, 45, 15)
@@ -290,6 +395,7 @@ with st.sidebar:
     include_edge = st.toggle("Include edge cases",       value=True)
     st.markdown('</div>', unsafe_allow_html=True)
 
+    # Pipeline Status
     st.markdown("---")
     st.markdown('<div class="sidebar-title">📋 Pipeline Status</div>', unsafe_allow_html=True)
     stage = st.session_state.stage or 0
@@ -318,7 +424,6 @@ with col_left:
     tab_img, tab_txt = st.tabs(["🖼️ Upload Images", "📝 Type / Paste Text"])
 
     with tab_img:
-        # FIX 3: Added non-empty label, hidden with label_visibility
         images = st.file_uploader(
             "Upload feature images",
             type=["jpg", "jpeg", "png", "webp", "bmp"],
@@ -327,8 +432,7 @@ with col_left:
         )
         if images:
             for img in images:
-                # FIX 4: Replaced use_container_width with width
-                st.image(img, caption=img.name, width="stretch")
+                st.image(img, caption=img.name, use_container_width=True)
 
     with tab_txt:
         manual_text = st.text_area(
@@ -375,7 +479,6 @@ Include: positive, negative, edge cases.""",
             combined_text += f"\n\n[Manual Description]\n{manual_text.strip()}"
 
         combined_text = combined_text.strip()
-
         if not combined_text:
             st.error("❌ Could not extract text. Please add a description in the text tab.")
             st.stop()
@@ -409,7 +512,7 @@ Feature Story:
             similar = rag_retrieve(parsed)
             st.session_state.similar_cases = similar
 
-        # ── Stage 4: Generate Test Cases — Split into 2 calls ──
+        # ── Stage 4: Generate — 2 fast batches ────────────────
         st.session_state.stage = 4
 
         if include_neg and include_edge:
@@ -419,53 +522,54 @@ Feature Story:
         else:
             pos, neg, edge = num_cases, 0, 0
 
-        with st.spinner(f"⚙️ Generating {num_cases} test cases (batch 1)..."):
+        with st.spinner(f"⚙️ Generating positive test cases..."):
             prompt1 = f"""You are a senior QA engineer. Generate exactly {pos} POSITIVE test cases.
 
 Requirements:
 {parsed}
 
-Reference style from past test cases:
+Reference style — follow this EXACT format from past test cases:
 {similar}
 
-Each test MUST have exactly 5 numbered steps:
-1. Navigate to...  2. Open/Select...  3. Enter/Click...  4. Submit...  5. Verify...
+Rules:
+- Each test MUST have exactly 5 numbered steps
+- Format: 1. Navigate to...; 2. Open/Select...; 3. Enter/Click...; 4. Submit...; 5. Verify...
+- Return ONLY pipe-delimited rows. No headings. No extra text.
 
-Return ONLY pipe-delimited rows. No headings. No extra text.
-| TC001 | Title | Preconditions | 1. Step one; 2. Step two; 3. Step three; 4. Step four; 5. Step five | Expected result | High |
+| TC001 | Title | Preconditions | 1. Step; 2. Step; 3. Step; 4. Step; 5. Step | Expected result | High |
 
-Generate exactly {pos} rows starting from TC001.
+Generate exactly {pos} rows starting TC001.
 """
             batch1 = call_groq(prompt1, api_key, max_tokens=2000)
 
-        if include_neg or include_edge:
-            with st.spinner(f"⚙️ Generating {num_cases} test cases (batch 2)..."):
+        if neg > 0 or edge > 0:
+            with st.spinner(f"⚙️ Generating negative and edge test cases..."):
                 start_num = pos + 1
-                prompt2 = f"""You are a senior QA engineer.
-Generate {neg} NEGATIVE test cases and {edge} EDGE case test cases.
+                prompt2   = f"""You are a senior QA engineer.
+Generate {neg} NEGATIVE and {edge} EDGE test cases.
 
 Requirements:
 {parsed}
 
-NEGATIVE tests: invalid inputs, unauthorized access, service unavailable, corrupted data.
-EDGE cases: empty fields, boundary values, special characters, leap year, timezone, large datasets.
+NEGATIVE: invalid inputs, unauthorized access, service unavailable, corrupted data.
+EDGE: empty fields, boundary values, special chars, leap year, timezone, large datasets.
 
-Each test MUST have exactly 5 numbered steps:
-1. Navigate to...  2. Open/Select...  3. Enter/Click...  4. Submit...  5. Verify...
+Rules:
+- Each test MUST have exactly 5 numbered steps
+- Return ONLY pipe-delimited rows. No headings. No extra text.
 
-Return ONLY pipe-delimited rows. No headings. No extra text.
 | TC{start_num:03d} | Title | Preconditions | 1. Step; 2. Step; 3. Step; 4. Step; 5. Step | Expected | Medium |
 
-Generate exactly {neg + edge} rows starting from TC{start_num:03d}.
+Generate exactly {neg + edge} rows starting TC{start_num:03d}.
 """
-                batch2 = call_groq(prompt2, api_key, max_tokens=2000)
+                batch2     = call_groq(prompt2, api_key, max_tokens=2000)
                 test_cases = batch1 + "\n" + batch2
         else:
             test_cases = batch1
 
         st.session_state.test_cases = test_cases
         lines = [l for l in test_cases.split("\n") if "|" in l and "---" not in l]
-        st.session_state.tc_count = len(lines)
+        st.session_state.tc_count   = len(lines)
 
         # ── Stage 5: Excel Export ─────────────────────────────
         st.session_state.stage = 5
@@ -483,6 +587,7 @@ Generate exactly {neg + edge} rows starting from TC{start_num:03d}.
         st.rerun()
 
 
+# ── Results ────────────────────────────────────────────────────────────────────
 with col_right:
     st.markdown('<div class="card-label">📋 Results</div>', unsafe_allow_html=True)
 
@@ -499,8 +604,7 @@ with col_right:
     else:
         tc        = st.session_state.tc_count or 0
         chars     = len(st.session_state.extracted_text or "")
-        _, col_db = get_rag()
-        rag_total = col_db.count()
+        rag_total = st.session_state.rag_count or 0
 
         st.markdown(f"""
         <div class="success-box">
