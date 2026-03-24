@@ -594,9 +594,7 @@ with col_left:
             height=220,
             placeholder="""Paste your Jira story, acceptance criteria, or feature description here.
 
-Example:
-Feature: Year Format Changes in Templates
-As an ignio admin, I want all templates to display dates in the new year format.
+
 
 Acceptance Criteria:
 1. Incident report template shows date in new format
