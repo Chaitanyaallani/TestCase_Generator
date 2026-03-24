@@ -594,16 +594,8 @@ with col_left:
             height=220,
             placeholder="""Paste your Jira story, acceptance criteria, or feature description here.
 
-
-
 Acceptance Criteria:
-1. Incident report template shows date in new format
-2. Email notification template uses new format
-3. CSV/Excel/PDF exports maintain new format
-4. Dashboard date filters show new format
-5. System rejects invalid year formats with clear error message
-
-User Roles: ignio admin, regular user
+User Roles: admin, regular user
 Modules: incident report, dashboard, email, CSV export, Excel export, PDF export""",
             label_visibility="hidden"
         )
