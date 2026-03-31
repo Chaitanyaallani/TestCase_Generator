@@ -1,15 +1,21 @@
 import streamlit as st
 from groq import Groq
 import pytesseract
-from PIL import Image
+from PIL import Image, ImageFilter, ImageEnhance
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 import chromadb
 from sentence_transformers import SentenceTransformer
 import io, os, re, json
+import urllib.request
 
-st.set_page_config(page_title="QA Test Case Generator", page_icon="🧪", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(
+    page_title="QA Test Case Generator",
+    page_icon="🧪",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
 st.markdown("""
 <style>
@@ -28,6 +34,8 @@ st.markdown("""
 .metric-val { font-family:'IBM Plex Mono',monospace; font-size:1.8rem; font-weight:700; color:#1A1A2E; }
 .metric-lbl { font-size:0.7rem; color:#9B8EA0; text-transform:uppercase; letter-spacing:1px; margin-top:0.2rem; }
 .success-box { background:#E8F5E9; border:1px solid #A5D6A7; border-left:4px solid #2E7D32; border-radius:8px; padding:1.2rem 1.5rem; margin:1rem 0; color:#1B5E20; font-weight:500; }
+.warn-box { background:#FFF3CD; border:1px solid #FFD580; border-left:4px solid #F59E0B; border-radius:8px; padding:1rem 1.2rem; margin:0.5rem 0; color:#92400E; font-size:0.88rem; }
+.info-box { background:#E3F2FD; border:1px solid #90CAF9; border-left:4px solid #1565C0; border-radius:8px; padding:1rem 1.2rem; margin:0.5rem 0; color:#0D47A1; font-size:0.88rem; }
 .rag-ok { background:#E8F5E9; border:1px solid #A5D6A7; border-left:3px solid #2E7D32; border-radius:6px; padding:0.6rem 0.8rem; font-size:0.8rem; color:#1B5E20; margin-top:0.5rem; }
 .rag-warn { background:#FFF3CD; border:1px solid #FFD580; border-left:3px solid #F59E0B; border-radius:6px; padding:0.6rem 0.8rem; font-size:0.8rem; color:#92400E; margin-top:0.5rem; }
 .stButton > button { background:#1A1A2E !important; color:#E8F4FD !important; border:none !important; border-radius:8px !important; font-family:'IBM Plex Mono',monospace !important; font-size:0.82rem !important; font-weight:600 !important; letter-spacing:1px !important; padding:0.65rem 1.5rem !important; width:100% !important; transition:all 0.2s !important; }
@@ -46,6 +54,7 @@ defaults = {
     "test_cases_parsed": [], "excel_bytes": None,
     "stage": 0, "tc_count": 0, "pos_count": 0, "neg_count": 0, "edge_count": 0,
     "rag_loaded": False, "rag_count": 0, "rag_docs": [], "last_tc_id": 3000,
+    "ocr_warnings": [],
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -75,14 +84,102 @@ def call_groq(prompt: str, api_key: str, max_tokens: int = 3000) -> str:
     return response.choices[0].message.content
 
 
-# ── Helper: OCR ────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# OCR — WITH IMAGE PREPROCESSING FOR BETTER RESULTS
+# ══════════════════════════════════════════════════════════════════════════════
+def preprocess_image(image: Image.Image) -> Image.Image:
+    """Enhance image quality before OCR for better text extraction."""
+    img = image.convert("RGB")
+    # Increase size for better OCR
+    w, h = img.size
+    if w < 1000:
+        scale = 1000 / w
+        img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+    # Enhance contrast and sharpness
+    img = ImageEnhance.Contrast(img).enhance(2.0)
+    img = ImageEnhance.Sharpness(img).enhance(2.0)
+    # Convert to grayscale for better OCR
+    img = img.convert("L")
+    return img
+
+
 def run_ocr(image: Image.Image) -> str:
-    return pytesseract.image_to_string(image.convert("RGB"), config="--psm 6").strip()
+    """Run OCR with preprocessing and multiple config attempts."""
+    warnings = []
+
+    # Try with preprocessing first
+    try:
+        enhanced = preprocess_image(image)
+        text = pytesseract.image_to_string(enhanced, config="--psm 6 --oem 3")
+        if len(text.strip()) > 30:
+            return text.strip(), []
+    except Exception:
+        pass
+
+    # Try raw RGB
+    try:
+        text = pytesseract.image_to_string(image.convert("RGB"), config="--psm 6")
+        if len(text.strip()) > 30:
+            return text.strip(), []
+    except Exception:
+        pass
+
+    # Try different PSM modes
+    for psm in [11, 3, 4]:
+        try:
+            text = pytesseract.image_to_string(image.convert("L"), config=f"--psm {psm}")
+            if len(text.strip()) > 30:
+                return text.strip(), [f"Used alternate OCR mode (psm={psm}) for this image"]
+        except Exception:
+            pass
+
+    # OCR failed — return empty with warning
+    return "", ["⚠️ OCR could not extract text from this image. It may contain embedded images, diagrams, or low-resolution content. Please paste the feature description manually in the text tab."]
 
 
-# ── Helper: RAG ────────────────────────────────────────────────────────────────
+def extract_text_from_docx(file_bytes: bytes) -> str:
+    """Extract text from .docx files."""
+    try:
+        import zipfile
+        from xml.etree import ElementTree as ET
+
+        with zipfile.ZipFile(io.BytesIO(file_bytes)) as z:
+            if "word/document.xml" not in z.namelist():
+                return ""
+            xml_content = z.read("word/document.xml")
+
+        tree = ET.fromstring(xml_content)
+        ns   = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+        texts = []
+        for para in tree.iter("{http://schemas.openxmlformats.org/wordprocessingml/2006/main}p"):
+            para_text = "".join(
+                node.text or ""
+                for node in para.iter("{http://schemas.openxmlformats.org/wordprocessingml/2006/main}t")
+            )
+            if para_text.strip():
+                texts.append(para_text.strip())
+        return "\n".join(texts)
+    except Exception as e:
+        return ""
+
+
+def extract_text_from_txt(file_bytes: bytes) -> str:
+    """Extract text from .txt files."""
+    try:
+        return file_bytes.decode("utf-8").strip()
+    except Exception:
+        try:
+            return file_bytes.decode("latin-1").strip()
+        except Exception:
+            return ""
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# RAG
+# ══════════════════════════════════════════════════════════════════════════════
 def load_excel_to_rag(excel_bytes: bytes) -> tuple:
-    embed, _, col = load_embed_model(), None, load_chroma()[1]
+    embed = load_embed_model()
+    _, col = load_chroma()
     docs, total, last_id = [], 0, 3000
     wb = openpyxl.load_workbook(io.BytesIO(excel_bytes))
     for sname in wb.sheetnames:
@@ -94,7 +191,10 @@ def load_excel_to_rag(excel_bytes: bytes) -> tuple:
             tc_val = str(row[0]) if row[0] else ""
             for s in re.findall(r'\d+', tc_val):
                 last_id = max(last_id, int(s))
-            row_text = "\n".join(f"{headers[i]}: {v}" for i, v in enumerate(row) if v is not None and i < len(headers))
+            row_text = "\n".join(
+                f"{headers[i]}: {v}" for i, v in enumerate(row)
+                if v is not None and i < len(headers)
+            )
             if not row_text.strip(): continue
             docs.append(row_text)
             emb = embed.encode(row_text).tolist()
@@ -111,7 +211,8 @@ def load_excel_to_rag(excel_bytes: bytes) -> tuple:
 
 
 def rag_retrieve(query: str) -> str:
-    embed, _, col = load_embed_model(), None, load_chroma()[1]
+    embed = load_embed_model()
+    _, col = load_chroma()
     if col.count() == 0 and st.session_state.rag_docs:
         for i, doc in enumerate(st.session_state.rag_docs):
             emb = embed.encode(doc).tolist()
@@ -125,8 +226,54 @@ def rag_retrieve(query: str) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CORE FIX: Generate test cases as JSON — no pipe parsing issues ever
+# JSON GENERATION — ROBUST WITH RETRY
 # ══════════════════════════════════════════════════════════════════════════════
+def parse_json_response(raw: str) -> list:
+    """Try multiple strategies to extract JSON array from AI response."""
+
+    # Strategy 1: Direct parse
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, list) and len(parsed) > 0:
+            return parsed
+    except Exception:
+        pass
+
+    # Strategy 2: Extract [...] block
+    try:
+        match = re.search(r'\[[\s\S]*\]', raw)
+        if match:
+            parsed = json.loads(match.group())
+            if isinstance(parsed, list) and len(parsed) > 0:
+                return parsed
+    except Exception:
+        pass
+
+    # Strategy 3: Strip markdown fences
+    try:
+        cleaned = re.sub(r'```json|```', '', raw).strip()
+        parsed  = json.loads(cleaned)
+        if isinstance(parsed, list) and len(parsed) > 0:
+            return parsed
+    except Exception:
+        pass
+
+    # Strategy 4: Fix common JSON issues (trailing commas, single quotes)
+    try:
+        cleaned = re.sub(r',\s*}', '}', raw)
+        cleaned = re.sub(r',\s*\]', ']', cleaned)
+        cleaned = re.sub(r"'", '"', cleaned)
+        match   = re.search(r'\[[\s\S]*\]', cleaned)
+        if match:
+            parsed = json.loads(match.group())
+            if isinstance(parsed, list) and len(parsed) > 0:
+                return parsed
+    except Exception:
+        pass
+
+    return []
+
+
 def generate_test_cases_as_json(
     combined_text: str,
     feature_understanding: str,
@@ -137,198 +284,156 @@ def generate_test_cases_as_json(
     include_neg: bool,
     include_edge: bool
 ) -> list:
-    """
-    Generate test cases as JSON array — completely solves the
-    multiline step parsing problem that was breaking pipe-delimited output.
-    """
-    # Calculate split
+    """Generate test cases as JSON with retry on failure."""
+
     if include_neg and include_edge:
-        pos  = num_cases // 3 + (num_cases % 3)
-        neg  = num_cases // 3
+        pos = num_cases // 3 + (num_cases % 3)
+        neg = num_cases // 3
         edge = num_cases - pos - neg
     elif include_neg:
-        pos  = num_cases // 2 + (num_cases % 2)
-        neg  = num_cases - pos
+        pos = num_cases // 2 + (num_cases % 2)
+        neg = num_cases - pos
         edge = 0
     elif include_edge:
-        pos  = num_cases // 2 + (num_cases % 2)
-        neg  = 0
+        pos = num_cases // 2 + (num_cases % 2)
+        neg = 0
         edge = num_cases - pos
     else:
         pos, neg, edge = num_cases, 0, 0
 
     start_id = last_tc_id + 1
 
-    # Study examples from Copilot style
-    copilot_example = """
-EXAMPLE OF REQUIRED QUALITY (match this exactly):
-
-TC-3651 | Verify year format change in incident report template displays correctly
-Prerequisites: User: ignio admin logged in, Incident report template accessible, Test incident data available
-Steps:
-  1. Navigate to incident management system
-  2. Open an existing incident with date "Jan 23, 2026"
-  3. Generate incident report using standard template
-  4. Review the date format in generated report
-  5. Verify year is displayed in new required format
-Expected: Incident report displays date with correct year format. Template adheres to new format standard. No formatting errors in report.
-Type: Positive | Priority: High
-
-TC-3669 | Verify system handles invalid year format input gracefully
-Prerequisites: User: ignio admin logged in, Template configuration accessible
-Steps:
-  1. Navigate to template configuration
-  2. Attempt to manually set invalid year format (e.g., 3-digit year)
-  3. Try to save configuration
-  4. Observe system response
-  5. Verify error handling
-Expected: System displays appropriate error message. Invalid format is rejected with clear explanation. Original format is preserved.
-Type: Negative | Priority: High
-
-TC-3684 | Verify template handles year boundary transition (Dec 31 to Jan 1)
-Prerequisites: User: ignio admin logged in, Data spanning year boundary available
-Steps:
-  1. Generate template with data from Dec 31, 2025 to Jan 1, 2026
-  2. Review date formatting across year boundary
-  3. Check chronological ordering
-  4. Verify no date format inconsistencies
-  5. Test with multiple year boundaries
-Expected: Template correctly handles year boundary transitions. Date formatting remains consistent across boundaries. Chronological ordering preserved correctly.
-Type: Edge | Priority: High
-"""
-
-    prompt = f"""You are a Senior QA Architect generating enterprise UI test cases.
-
-FEATURE INPUT:
-{combined_text}
+    # Build the prompt
+    prompt = f"""You are a Senior QA Architect. Generate exactly {num_cases} UI test cases.
 
 FEATURE UNDERSTANDING:
 {feature_understanding}
 
-SIMILAR PAST TEST CASES (study their style):
+PAST TEST CASES STYLE REFERENCE (match this quality):
 {similar_cases}
 
-{copilot_example}
+RULES:
+- {pos} Positive + {neg} Negative + {edge} Edge cases
+- TC IDs start from TC-{start_id:04d}
+- Prerequisites: specific role, module, test data
+- Steps: exactly 5, each a single specific UI action on a named element
+- Expected: exact visible UI outcome — screen name, message text, element state
+- NEVER use: "works correctly", "saves successfully", "behaves as expected"
 
-TASK: Generate {num_cases} test cases ({pos} Positive + {neg} Negative + {edge} Edge).
+RETURN ONLY a valid JSON array. Nothing else before or after.
 
-STRICT QUALITY RULES:
-1. Prerequisites: MUST include "User: [specific role] logged in, [specific module] accessible, [specific test data] available"
-2. Steps: MUST be EXACTLY 5 steps — each step is ONE specific UI action on a named UI element
-3. Expected Result: MUST describe the EXACT visible UI outcome — screen name, message text, element state — NEVER say "works correctly" or "saves successfully"
-4. Test Type: MUST be exactly Positive / Negative / Edge
-5. Priority: High = core flows and AC coverage, Medium = validations, Low = edge/boundary
-6. Title: MUST be clear and action-oriented — start with "Verify..."
-7. IDs start from TC-{start_id:04d} and increment
-
-FORBIDDEN in Expected Result: "works correctly", "saves successfully", "behaves as expected", "is displayed correctly" alone
-
-RETURN ONLY valid JSON array. No explanation. No markdown. No extra text.
-Format:
 [
   {{
     "id": "TC-{start_id:04d}",
-    "title": "Verify year format change in incident report template displays correctly",
-    "prerequisites": "User: ignio admin logged in, Incident report template accessible, Test incident data available",
+    "title": "Verify year format in incident report template displays correctly",
+    "prerequisites": "User: ignio admin logged in, Incident report template accessible, Test data with date Jan 23 2026 available",
     "steps": "1. Navigate to incident management system\\n2. Open existing incident with date Jan 23 2026\\n3. Generate incident report using standard template\\n4. Review date format in generated report\\n5. Verify year displays in new required format",
-    "expected": "Incident report displays date with correct year format. Template adheres to new format standard. No formatting errors in report.",
+    "expected": "Incident report displays date in correct year format. Template adheres to new standard. No formatting errors visible.",
     "type": "Positive",
+    "priority": "High",
+    "related_tc": "None"
+  }},
+  {{
+    "id": "TC-{start_id+1:04d}",
+    "title": "Verify system rejects invalid year format with error message",
+    "prerequisites": "User: ignio admin logged in, Template configuration screen accessible",
+    "steps": "1. Navigate to template configuration screen\\n2. Locate the year format input field\\n3. Enter invalid year format e.g. 3-digit year '202'\\n4. Click Save button\\n5. Verify error message appears on screen",
+    "expected": "System displays error message 'Invalid year format. Please use the required format.' Save is blocked. Field is highlighted in red.",
+    "type": "Negative",
     "priority": "High",
     "related_tc": "None"
   }}
 ]
 
-Generate exactly {num_cases} objects in the JSON array.
+Now generate all {num_cases} test cases for this feature:
+{combined_text[:800]}
+
+Return ONLY the JSON array starting with [ and ending with ].
 """
 
-    raw = call_groq(prompt, api_key, max_tokens=4000)
+    # First attempt
+    raw    = call_groq(prompt, api_key, max_tokens=4000)
+    result = parse_json_response(raw)
 
-    # Robust JSON extraction
-    try:
-        # Try direct parse
-        parsed = json.loads(raw)
-        if isinstance(parsed, list):
-            return parsed
-    except Exception:
-        pass
+    if result:
+        return result
 
-    try:
-        # Extract JSON array from response
-        match = re.search(r'\[.*\]', raw, re.DOTALL)
-        if match:
-            parsed = json.loads(match.group())
-            if isinstance(parsed, list):
-                return parsed
-    except Exception:
-        pass
+    # Retry with simpler prompt
+    retry_prompt = f"""Generate {num_cases} test cases as a JSON array.
 
-    try:
-        # Strip markdown fences
-        cleaned = re.sub(r'```json|```', '', raw).strip()
-        parsed  = json.loads(cleaned)
-        if isinstance(parsed, list):
-            return parsed
-    except Exception:
-        pass
+Feature: {combined_text[:400]}
 
-    # If all parsing fails, return empty list
-    return []
+Return ONLY this JSON format, no other text:
+[
+  {{
+    "id": "TC-{start_id:04d}",
+    "title": "test case title",
+    "prerequisites": "User: role logged in, module accessible, test data available",
+    "steps": "1. Navigate to page\\n2. Click element\\n3. Enter value\\n4. Submit\\n5. Verify result",
+    "expected": "Exact visible UI outcome with screen name and message text",
+    "type": "Positive",
+    "priority": "High",
+    "related_tc": "None"
+  }}
+]
+Generate {num_cases} objects. Types: {pos} Positive, {neg} Negative, {edge} Edge.
+Start IDs from TC-{start_id:04d}.
+"""
+    raw    = call_groq(retry_prompt, api_key, max_tokens=4000)
+    result = parse_json_response(raw)
+
+    return result
 
 
-# ── Helper: Build Excel ────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# EXCEL BUILDER
+# ══════════════════════════════════════════════════════════════════════════════
 def build_excel(test_cases: list, feature_name: str) -> bytes:
-    """
-    Build Excel from parsed list of dicts.
-    Color coding: Green=Positive, Orange=Negative, Yellow=Edge
-    """
-    wb = openpyxl.Workbook()
-
-    # Counts
-    pos_count  = sum(1 for tc in test_cases if "positive" in str(tc.get("type","")).lower())
-    neg_count  = sum(1 for tc in test_cases if "negative" in str(tc.get("type","")).lower())
-    edge_count = sum(1 for tc in test_cases if "edge"     in str(tc.get("type","")).lower())
-
-    # ── SUMMARY SHEET ─────────────────────────────────────────────────────────
-    ws_sum       = wb.active
-    ws_sum.title = "SUMMARY"
+    wb     = openpyxl.Workbook()
     h_fill = PatternFill("solid", fgColor="1A1A2E")
     h_font = Font(bold=True, color="E8F4FD", name="Calibri", size=11)
     c_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
-    sum_headers = ["Feature / Module Name","Total Test Cases","Positive Count",
-                   "Negative Count","Edge Case Count","Acceptance Criteria Covered","Gaps Identified"]
-    for c, h in enumerate(sum_headers, 1):
+    pos_count  = sum(1 for tc in test_cases if "positive" in str(tc.get("type","")).lower())
+    neg_count  = sum(1 for tc in test_cases if "negative" in str(tc.get("type","")).lower())
+    edge_count = sum(1 for tc in test_cases if "edge"     in str(tc.get("type","")).lower())
+
+    # Summary sheet
+    ws_sum = wb.active
+    ws_sum.title = "SUMMARY"
+    sum_hdrs = ["Feature / Module Name","Total Test Cases","Positive Count",
+                "Negative Count","Edge Case Count","Acceptance Criteria Covered","Gaps Identified"]
+    for c, h in enumerate(sum_hdrs, 1):
         cell = ws_sum.cell(row=1, column=c, value=h)
         cell.fill = h_fill; cell.font = h_font; cell.alignment = c_align
         ws_sum.column_dimensions[get_column_letter(c)].width = 22
-
     ws_sum.cell(row=2, column=1, value=feature_name)
     ws_sum.cell(row=2, column=2, value=len(test_cases))
     ws_sum.cell(row=2, column=3, value=pos_count)
     ws_sum.cell(row=2, column=4, value=neg_count)
     ws_sum.cell(row=2, column=5, value=edge_count)
     ws_sum.cell(row=2, column=6, value="Extracted from feature input")
-    ws_sum.cell(row=2, column=7, value="Legacy system integration, Performance impact testing")
+    ws_sum.cell(row=2, column=7, value="Legacy system integration, Performance testing")
     ws_sum.freeze_panes = "A2"
 
-    # ── TEST CASE SHEET ────────────────────────────────────────────────────────
-    ws       = wb.create_sheet(title=feature_name[:31])
-    tc_hdrs  = ["Test Case ID","Test Case Title","Prerequisites",
-                "Test Steps","Expected Result","Test Type","Priority","Related TC ID"]
-    widths   = [14, 35, 32, 55, 42, 12, 10, 14]
+    # Test case sheet
+    ws = wb.create_sheet(title=feature_name[:31])
+    tc_hdrs = ["Test Case ID","Test Case Title","Prerequisites",
+               "Test Steps","Expected Result","Test Type","Priority","Related TC ID"]
+    widths  = [14, 35, 32, 55, 42, 12, 10, 14]
 
-    pos_fill  = PatternFill("solid", fgColor="E2EFDA")  # green
-    neg_fill  = PatternFill("solid", fgColor="FCE4D6")  # orange/red
-    edge_fill = PatternFill("solid", fgColor="FFF2CC")  # yellow
+    pos_fill  = PatternFill("solid", fgColor="E2EFDA")
+    neg_fill  = PatternFill("solid", fgColor="FCE4D6")
+    edge_fill = PatternFill("solid", fgColor="FFF2CC")
     pos_alt   = PatternFill("solid", fgColor="D0E8C5")
     neg_alt   = PatternFill("solid", fgColor="F0D0B8")
     edge_alt  = PatternFill("solid", fgColor="EFE8AA")
 
-    n_font  = Font(name="Calibri", size=10)
-    l_align = Alignment(horizontal="left",   vertical="top", wrap_text=True)
-    mid_align = Alignment(horizontal="center", vertical="top", wrap_text=True)
-    thin    = Side(style="thin", color="CCCCCC")
-    bdr     = Border(left=thin, right=thin, top=thin, bottom=thin)
+    n_font   = Font(name="Calibri", size=10)
+    l_align  = Alignment(horizontal="left",   vertical="top", wrap_text=True)
+    m_align  = Alignment(horizontal="center", vertical="top", wrap_text=True)
+    thin     = Side(style="thin", color="CCCCCC")
+    bdr      = Border(left=thin, right=thin, top=thin, bottom=thin)
 
     for c, (h, w) in enumerate(zip(tc_hdrs, widths), 1):
         cell = ws.cell(row=1, column=c, value=h)
@@ -341,30 +446,24 @@ def build_excel(test_cases: list, feature_name: str) -> bytes:
     for ri, tc in enumerate(test_cases, 2):
         tc_type = str(tc.get("type", "")).lower()
         is_alt  = ri % 2 == 0
-        if "negative" in tc_type:
-            fill = neg_alt  if is_alt else neg_fill
-        elif "edge" in tc_type:
-            fill = edge_alt if is_alt else edge_fill
-        else:
-            fill = pos_alt  if is_alt else pos_fill
+        fill    = (neg_alt if is_alt else neg_fill) if "negative" in tc_type else \
+                  (edge_alt if is_alt else edge_fill) if "edge" in tc_type else \
+                  (pos_alt  if is_alt else pos_fill)
 
         values = [
-            tc.get("id",          f"TC-{ri+3000:04d}"),
-            tc.get("title",       ""),
+            tc.get("id",           f"TC-{3000+ri:04d}"),
+            tc.get("title",        ""),
             tc.get("prerequisites",""),
-            tc.get("steps",       ""),
-            tc.get("expected",    ""),
-            tc.get("type",        ""),
-            tc.get("priority",    ""),
-            tc.get("related_tc",  "None"),
+            tc.get("steps",        ""),
+            tc.get("expected",     ""),
+            tc.get("type",         ""),
+            tc.get("priority",     ""),
+            tc.get("related_tc",   "None"),
         ]
-
         for ci, val in enumerate(values, 1):
             cell = ws.cell(row=ri, column=ci, value=val)
-            cell.font   = n_font
-            cell.border = bdr
-            cell.fill   = fill
-            cell.alignment = mid_align if ci in [1,6,7,8] else l_align
+            cell.font = n_font; cell.border = bdr; cell.fill = fill
+            cell.alignment = m_align if ci in [1,6,7,8] else l_align
         ws.row_dimensions[ri].height = 80
 
     buf = io.BytesIO()
@@ -378,7 +477,7 @@ def build_excel(test_cases: list, feature_name: str) -> bytes:
 st.markdown("""
 <div class="app-header">
     <div class="app-title">QA Test Case Generator</div>
-    <div class="app-sub">Copilot-quality enterprise test cases — powered by Groq AI + RAG</div>
+    <div class="app-sub">Copilot-quality enterprise test cases — Groq AI + RAG + JSON pipeline</div>
     <div style="margin-top:0.8rem">
         <span class="tag">GROQ AI</span><span class="tag">OCR</span>
         <span class="tag">RAG</span><span class="tag">JSON PIPELINE</span><span class="tag">EXCEL EXPORT</span>
@@ -388,17 +487,19 @@ st.markdown("""
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
+
     st.markdown('<div class="sidebar-section">', unsafe_allow_html=True)
     st.markdown('<div class="sidebar-title">🔑 Groq API Key</div>', unsafe_allow_html=True)
-    api_key = st.text_input("Groq API Key", type="password", placeholder="Paste your gsk_... key", label_visibility="hidden")
+    api_key = st.text_input("Groq API Key", type="password",
+                            placeholder="Paste your gsk_... key", label_visibility="hidden")
     st.caption("Free key → [console.groq.com](https://console.groq.com)")
     st.markdown('</div>', unsafe_allow_html=True)
 
     st.markdown('<div class="sidebar-section">', unsafe_allow_html=True)
     st.markdown('<div class="sidebar-title">📊 Existing Test Cases (RAG)</div>', unsafe_allow_html=True)
-    st.caption("Upload master Excel → app avoids duplicates and matches your style")
-    past_excel = st.file_uploader("Upload existing test cases", type=["xlsx","xls"], label_visibility="hidden")
-
+    st.caption("Upload master Excel → avoids duplicates, matches your style")
+    past_excel = st.file_uploader("Upload existing test cases",
+                                  type=["xlsx","xls"], label_visibility="hidden")
     if past_excel and not st.session_state.rag_loaded:
         with st.spinner("Loading into RAG..."):
             count, last_id = load_excel_to_rag(past_excel.read())
@@ -406,8 +507,7 @@ with st.sidebar:
     elif past_excel and st.session_state.rag_loaded:
         st.markdown(f'<div class="rag-ok">✅ {st.session_state.rag_count} test cases in RAG<br>Next TC ID: TC-{st.session_state.last_tc_id+1:04d}</div>', unsafe_allow_html=True)
     else:
-        st.markdown('<div class="rag-warn">⚠️ Upload your master Excel for better quality and duplicate prevention</div>', unsafe_allow_html=True)
-
+        st.markdown('<div class="rag-warn">⚠️ Upload your master Excel for better quality</div>', unsafe_allow_html=True)
     if st.session_state.rag_loaded:
         if st.button("🗑️ Clear RAG"):
             for k in ["rag_loaded","rag_count","rag_docs","last_tc_id"]:
@@ -425,9 +525,7 @@ with st.sidebar:
     st.markdown("---")
     st.markdown('<div class="sidebar-title">📋 Pipeline Status</div>', unsafe_allow_html=True)
     stage = st.session_state.stage or 0
-    steps = ["🔍 OCR — Read Input","🧠 Parse Feature Understanding",
-             "📚 RAG — Find Similar Cases","⚙️ Generate Test Cases (JSON)",
-             "📊 Build Excel with Color Coding"]
+    steps = ["🔍 Extract Text","🧠 Parse Feature","📚 RAG Search","⚙️ Generate JSON","📊 Build Excel"]
     for i, label in enumerate(steps):
         color = "#2E7D32" if i < stage else ("#1565C0" if i == stage and stage > 0 else "#9B8EA0")
         icon  = "✅" if i < stage else ("⏳" if i == stage and stage > 0 else "○")
@@ -439,76 +537,180 @@ col_left, col_right = st.columns([1, 1], gap="large")
 
 with col_left:
     st.markdown('<div class="card-label">📤 Feature Input</div>', unsafe_allow_html=True)
-    tab_img, tab_txt = st.tabs(["🖼️ Upload Images", "📝 Paste Feature / Jira Story"])
+
+    # ── Input type selector ────────────────────────────────────────────────────
+    tab_img, tab_doc, tab_txt = st.tabs(["🖼️ Images", "📄 Documents (.docx/.txt)", "📝 Text / Jira Story"])
 
     with tab_img:
-        images = st.file_uploader("Upload feature images", type=["jpg","jpeg","png","webp","bmp"], accept_multiple_files=True, label_visibility="hidden")
+        st.markdown("""
+        <div class="info-box">
+            💡 <strong>Tip:</strong> If your image has embedded diagrams or very small text,
+            OCR may not extract it well. In that case, also paste the description in the Text tab.
+        </div>
+        """, unsafe_allow_html=True)
+        images = st.file_uploader(
+            "Upload feature images",
+            type=["jpg","jpeg","png","webp","bmp"],
+            accept_multiple_files=True,
+            label_visibility="hidden"
+        )
         if images:
             for img in images:
                 st.image(img, caption=img.name, use_container_width=True)
 
+    with tab_doc:
+        st.markdown("""
+        <div class="info-box">
+            💡 <strong>Supported:</strong> .docx (Word) and .txt files.<br>
+            For VD (Visual Design) links or Figma — copy the text content and paste it in the Text tab instead.
+        </div>
+        """, unsafe_allow_html=True)
+        doc_files = st.file_uploader(
+            "Upload .docx or .txt files",
+            type=["docx","txt"],
+            accept_multiple_files=True,
+            label_visibility="hidden"
+        )
+
     with tab_txt:
-        manual_text = st.text_area("Feature description", height=240,
-            placeholder="""Paste your Jira story, acceptance criteria, or feature description.
+        manual_text = st.text_area(
+            "Feature description",
+            height=240,
+            placeholder="""Paste your Jira story, acceptance criteria, VD link description, or feature description here.
 
 Example:
 Feature: Year Format Changes in Templates
-User: As ignio admin, I want all system templates to use the new year format.
+As ignio admin, I want all templates to display dates in new year format.
 
 Acceptance Criteria:
 1. Incident report template shows date in new format
-2. Email notification template uses new year format
+2. Email notification template uses new format
 3. CSV and Excel exports maintain new format
-4. Dashboard date filters display new format
+4. Dashboard filters display new format
 5. System rejects invalid year formats with error
 
-Modules affected: incident report, dashboard, email notifications,
-CSV export, Excel export, PDF export, maintenance window,
-alert template, rule mining, workitem evidence tab
+Modules: incident report, dashboard, email, CSV export,
+Excel export, PDF export, alert template, rule mining
 
-User Roles: ignio admin, regular user (read-only)""",
-            label_visibility="hidden")
+User Roles: ignio admin, regular user""",
+            label_visibility="hidden"
+        )
+
+    # VD Link input
+    st.markdown("**🔗 Or paste a VD / Figma / Confluence link:**")
+    vd_link = st.text_input(
+        "VD Link",
+        placeholder="https://your-vd-link.com/page",
+        label_visibility="hidden"
+    )
+    if vd_link:
+        st.markdown("""
+        <div class="warn-box">
+            ⚠️ <strong>Note:</strong> VD links (Figma, Confluence, Jira) require login — the app cannot access them directly.
+            Please open the link, copy the text content, and paste it in the Text tab above.
+        </div>
+        """, unsafe_allow_html=True)
 
     st.markdown("")
-    has_image = bool(images)
-    has_text  = bool(manual_text and manual_text.strip())
-    has_input = has_image or has_text
-    can_run   = has_input and bool(api_key)
 
-    if not api_key:       st.caption("🔑 Add your Groq API key in the sidebar")
-    elif not has_input:   st.caption("⬆️ Upload an image or paste a feature description")
+    # Determine what input we have
+    has_image   = bool(images)
+    has_doc     = bool(doc_files)
+    has_text    = bool(manual_text and manual_text.strip())
+    has_input   = has_image or has_doc or has_text
+    can_run     = has_input and bool(api_key)
 
+    if not api_key:     st.caption("🔑 Add your Groq API key in the sidebar")
+    elif not has_input: st.caption("⬆️ Upload images, documents, or paste text above")
+
+    # ── GENERATE BUTTON ────────────────────────────────────────────────────────
     if st.button("⚡ GENERATE TEST CASES", disabled=not can_run):
 
-        # Stage 1: OCR
-        st.session_state.stage = 1
         combined_text = ""
+        ocr_warnings  = []
+
+        # ── Stage 1: Extract text from all inputs ──────────────────────────────
+        st.session_state.stage = 1
+
+        # From images
         if has_image:
             with st.spinner("🔍 Extracting text from images..."):
                 for img_file in images:
-                    text = run_ocr(Image.open(img_file))
-                    if text: combined_text += f"\n\n[From: {img_file.name}]\n{text}"
+                    img          = Image.open(img_file)
+                    text, warns  = run_ocr(img)
+                    ocr_warnings.extend(warns)
+                    if text:
+                        combined_text += f"\n\n[From image: {img_file.name}]\n{text}"
+                    else:
+                        ocr_warnings.append(
+                            f"⚠️ No text extracted from '{img_file.name}'. "
+                            f"Please paste the content manually in the Text tab."
+                        )
+
+        # From documents
+        if has_doc:
+            with st.spinner("📄 Reading document files..."):
+                for doc_file in doc_files:
+                    file_bytes = doc_file.read()
+                    if doc_file.name.endswith(".docx"):
+                        text = extract_text_from_docx(file_bytes)
+                        if text:
+                            combined_text += f"\n\n[From document: {doc_file.name}]\n{text}"
+                        else:
+                            ocr_warnings.append(
+                                f"⚠️ Could not extract text from '{doc_file.name}'. "
+                                f"If it contains only images, please extract the text manually."
+                            )
+                    elif doc_file.name.endswith(".txt"):
+                        text = extract_text_from_txt(file_bytes)
+                        if text:
+                            combined_text += f"\n\n[From file: {doc_file.name}]\n{text}"
+
+        # From manual text
         if has_text:
             combined_text += f"\n\n[Feature Description]\n{manual_text.strip()}"
+
         combined_text = combined_text.strip()
+        st.session_state.ocr_warnings = ocr_warnings
+
+        # If no text extracted from any source
         if not combined_text:
-            st.error("❌ Could not extract text. Please add a description."); st.stop()
+            st.error("""
+❌ Could not extract any text from your inputs.
+
+**What to do:**
+1. Open your VD link / Figma / document in browser
+2. Copy the text content (Ctrl+A → Ctrl+C)
+3. Paste it in the **📝 Text / Jira Story** tab
+4. Click Generate again
+""")
+            st.stop()
+
+        # If text is too short — warn but continue
+        if len(combined_text) < 50:
+            st.warning(
+                "⚠️ Very little text was extracted. Results may be generic. "
+                "Consider adding more detail in the Text tab."
+            )
+
         st.session_state.extracted_text = combined_text
 
-        # Stage 2: Feature Understanding
+        # ── Stage 2: Feature Understanding ────────────────────────────────────
         st.session_state.stage = 2
         with st.spinner("🧠 Parsing feature and extracting acceptance criteria..."):
-            fu_prompt = f"""You are a Senior QA Architect. Parse this feature input and produce a FEATURE UNDERSTANDING.
+            fu_prompt = f"""You are a Senior QA Architect.
+Parse this feature input and produce a FEATURE UNDERSTANDING.
 
 Return EXACTLY in this format:
 Feature Name        : [name]
-User Roles          : [all roles]
-Screens / Pages     : [all screens]
-UI Components       : [all buttons, fields, dropdowns]
-User Flows          : [numbered list of flows]
+User Roles          : [all user roles mentioned]
+Screens / Pages     : [all screens/pages]
+UI Components       : [all buttons, fields, dropdowns, tabs]
+User Flows          : [numbered list of user flows]
 Acceptance Criteria : [numbered list — one per line]
 Business Rules      : [constraints, validations, permissions]
 Error / Edge States : [error messages, boundary conditions]
+Modules Affected    : [list all specific modules/templates]
 
 Feature Input:
 {combined_text}
@@ -516,12 +718,12 @@ Feature Input:
             feature_understanding = call_groq(fu_prompt, api_key, max_tokens=1000)
             st.session_state.feature_understand = feature_understanding
 
-        # Stage 3: RAG
+        # ── Stage 3: RAG ──────────────────────────────────────────────────────
         st.session_state.stage = 3
         with st.spinner("📚 Retrieving similar past test cases..."):
             similar = rag_retrieve(feature_understanding)
 
-        # Stage 4: Generate as JSON
+        # ── Stage 4: Generate JSON ─────────────────────────────────────────────
         st.session_state.stage = 4
         last_tc_id = st.session_state.last_tc_id or 3000
 
@@ -538,7 +740,16 @@ Feature Input:
             )
 
             if not test_cases:
-                st.error("❌ AI returned invalid JSON. Please try again.")
+                st.error("""
+❌ AI returned invalid JSON after 2 attempts.
+
+**Possible causes:**
+- Feature description is too short or unclear
+- Groq API rate limit hit — wait 30 seconds and try again
+- Try reducing the number of test cases in the slider
+
+**What to do:** Add more detail to your feature description and try again.
+""")
                 st.stop()
 
             st.session_state.test_cases_parsed = test_cases
@@ -547,11 +758,12 @@ Feature Input:
             st.session_state.neg_count  = sum(1 for t in test_cases if "negative" in t.get("type","").lower())
             st.session_state.edge_count = sum(1 for t in test_cases if "edge"     in t.get("type","").lower())
 
-        # Stage 5: Excel
+        # ── Stage 5: Excel ─────────────────────────────────────────────────────
         st.session_state.stage = 5
         with st.spinner("📊 Building formatted Excel with color coding..."):
             feature_name = "Feature"
-            if images:   feature_name = os.path.splitext(images[0].name)[0]
+            if images:        feature_name = os.path.splitext(images[0].name)[0]
+            elif doc_files:   feature_name = os.path.splitext(doc_files[0].name)[0]
             elif manual_text:
                 first = manual_text.strip().split("\n")[0]
                 feature_name = first[:30].replace("Feature:","").strip() or "Feature"
@@ -561,8 +773,14 @@ Feature Input:
         st.rerun()
 
 
+# ── Results ───────────────────────────────────────────────────────────────────
 with col_right:
     st.markdown('<div class="card-label">📋 Results</div>', unsafe_allow_html=True)
+
+    # Show OCR warnings if any
+    if st.session_state.ocr_warnings:
+        for w in st.session_state.ocr_warnings:
+            st.markdown(f'<div class="warn-box">{w}</div>', unsafe_allow_html=True)
 
     if not st.session_state.test_cases_parsed:
         st.markdown("""
@@ -580,7 +798,7 @@ with col_right:
         edge = st.session_state.edge_count or 0
         rag  = st.session_state.rag_count  or 0
 
-        st.markdown(f'<div class="success-box">✅ &nbsp; <strong>{tc} Copilot-quality test cases generated!</strong></div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="success-box">✅ &nbsp; <strong>{tc} enterprise test cases generated!</strong></div>', unsafe_allow_html=True)
         st.markdown(f"""
         <div class="metric-strip">
             <div class="metric"><div class="metric-val" style="color:#2E7D32">{pos}</div><div class="metric-lbl">✅ Positive</div></div>
@@ -589,10 +807,10 @@ with col_right:
             <div class="metric"><div class="metric-val">{rag}</div><div class="metric-lbl">📚 RAG</div></div>
         </div>""", unsafe_allow_html=True)
 
-        t1, t2, t3 = st.tabs(["📊 Test Cases Preview", "🧠 Feature Understanding", "🔍 OCR Output"])
+        t1, t2, t3 = st.tabs(["📊 Test Cases Preview", "🧠 Feature Understanding", "🔍 Extracted Text"])
 
         with t1:
-            tcs = st.session_state.test_cases_parsed
+            tcs     = st.session_state.test_cases_parsed
             preview = "\n\n".join(
                 f"{tc.get('id','')} | {tc.get('type','')} | {tc.get('priority','')}\n"
                 f"Title: {tc.get('title','')}\n"
@@ -610,10 +828,11 @@ with col_right:
             st.markdown(f'<div class="result-preview">{st.session_state.extracted_text or "—"}</div>', unsafe_allow_html=True)
 
         st.markdown("---")
+
         fname = "Feature"
-        if images:   fname = os.path.splitext(images[0].name)[0]
-        elif manual_text:
-            fname = manual_text.strip().split("\n")[0][:30].replace("Feature:","").strip() or "Feature"
+        if images:        fname = os.path.splitext(images[0].name)[0]
+        elif st.session_state.test_cases_parsed:
+            fname = st.session_state.test_cases_parsed[0].get("id","Feature").split("-")[0] + "_Feature"
 
         st.download_button(
             label     = "⬇️ DOWNLOAD EXCEL TEST CASES",
@@ -624,7 +843,7 @@ with col_right:
 
         if st.button("🔄 Generate New"):
             for k in ["extracted_text","feature_understand","test_cases_parsed",
-                      "excel_bytes","tc_count","pos_count","neg_count","edge_count"]:
-                st.session_state[k] = None if k != "test_cases_parsed" else []
+                      "excel_bytes","tc_count","pos_count","neg_count","edge_count","ocr_warnings"]:
+                st.session_state[k] = [] if k in ["test_cases_parsed","ocr_warnings"] else None
             st.session_state.stage = 0
             st.rerun()
