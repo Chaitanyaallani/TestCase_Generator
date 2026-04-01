@@ -1,5 +1,5 @@
 import streamlit as st
-import anthropic
+from groq import Groq
 import pytesseract
 from PIL import Image, ImageFilter, ImageEnhance
 import openpyxl
@@ -7,7 +7,8 @@ from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 import chromadb
 from sentence_transformers import SentenceTransformer
-import io, os, re, json, base64
+import io, os, re, json
+import urllib.request
 
 st.set_page_config(
     page_title="QA Test Case Generator",
@@ -72,36 +73,41 @@ def load_chroma():
     return client, col
 
 
-# ── Helper: Claude API ─────────────────────────────────────────────────────────
-def call_claude(system_prompt: str, user_content, api_key: str, max_tokens: int = 8000) -> str:
-    client = anthropic.Anthropic(api_key=api_key)
-    if isinstance(user_content, str):
-        user_content = [{"type": "text", "text": user_content}]
-    response = client.messages.create(
-        model      = "claude-sonnet-4-5-20251001",
-        max_tokens = max_tokens,
-        system     = system_prompt,
-        messages   = [{"role": "user", "content": user_content}]
+# ── Helper: Groq ───────────────────────────────────────────────────────────────
+def call_groq(prompt: str, api_key: str, max_tokens: int = 3000) -> str:
+    client   = Groq(api_key=api_key)
+    response = client.chat.completions.create(
+        model      = "llama-3.1-8b-instant",
+        messages   = [{"role": "user", "content": prompt}],
+        max_tokens = max_tokens
     )
-    return response.content[0].text
+    return response.choices[0].message.content
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# OCR
+# OCR — WITH IMAGE PREPROCESSING FOR BETTER RESULTS
 # ══════════════════════════════════════════════════════════════════════════════
 def preprocess_image(image: Image.Image) -> Image.Image:
+    """Enhance image quality before OCR for better text extraction."""
     img = image.convert("RGB")
+    # Increase size for better OCR
     w, h = img.size
     if w < 1000:
         scale = 1000 / w
         img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+    # Enhance contrast and sharpness
     img = ImageEnhance.Contrast(img).enhance(2.0)
     img = ImageEnhance.Sharpness(img).enhance(2.0)
+    # Convert to grayscale for better OCR
     img = img.convert("L")
     return img
 
 
-def run_ocr(image: Image.Image) -> tuple:
+def run_ocr(image: Image.Image) -> str:
+    """Run OCR with preprocessing and multiple config attempts."""
+    warnings = []
+
+    # Try with preprocessing first
     try:
         enhanced = preprocess_image(image)
         text = pytesseract.image_to_string(enhanced, config="--psm 6 --oem 3")
@@ -109,12 +115,16 @@ def run_ocr(image: Image.Image) -> tuple:
             return text.strip(), []
     except Exception:
         pass
+
+    # Try raw RGB
     try:
         text = pytesseract.image_to_string(image.convert("RGB"), config="--psm 6")
         if len(text.strip()) > 30:
             return text.strip(), []
     except Exception:
         pass
+
+    # Try different PSM modes
     for psm in [11, 3, 4]:
         try:
             text = pytesseract.image_to_string(image.convert("L"), config=f"--psm {psm}")
@@ -122,18 +132,24 @@ def run_ocr(image: Image.Image) -> tuple:
                 return text.strip(), [f"Used alternate OCR mode (psm={psm}) for this image"]
         except Exception:
             pass
+
+    # OCR failed — return empty with warning
     return "", ["⚠️ OCR could not extract text from this image. It may contain embedded images, diagrams, or low-resolution content. Please paste the feature description manually in the text tab."]
 
 
 def extract_text_from_docx(file_bytes: bytes) -> str:
+    """Extract text from .docx files."""
     try:
         import zipfile
         from xml.etree import ElementTree as ET
+
         with zipfile.ZipFile(io.BytesIO(file_bytes)) as z:
             if "word/document.xml" not in z.namelist():
                 return ""
             xml_content = z.read("word/document.xml")
+
         tree = ET.fromstring(xml_content)
+        ns   = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
         texts = []
         for para in tree.iter("{http://schemas.openxmlformats.org/wordprocessingml/2006/main}p"):
             para_text = "".join(
@@ -143,11 +159,12 @@ def extract_text_from_docx(file_bytes: bytes) -> str:
             if para_text.strip():
                 texts.append(para_text.strip())
         return "\n".join(texts)
-    except Exception:
+    except Exception as e:
         return ""
 
 
 def extract_text_from_txt(file_bytes: bytes) -> str:
+    """Extract text from .txt files."""
     try:
         return file_bytes.decode("utf-8").strip()
     except Exception:
@@ -209,196 +226,54 @@ def rag_retrieve(query: str) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SYSTEM PROMPT — MATCHES GITHUB COPILOT TCprompt.txt QUALITY EXACTLY
-# ══════════════════════════════════════════════════════════════════════════════
-SYSTEM_PROMPT = """You are a Senior QA Architect working on an EXISTING enterprise application.
-
-Your job is to generate comprehensive, precise, and non-duplicate UI test cases.
-
-========================================================
-STEP 1 — PARSE THE FEATURE INPUT
-========================================================
-
-Read all provided input (text + any images provided).
-
-Extract a FEATURE UNDERSTANDING:
-Feature Name        : [name from input]
-User Roles          : [all roles — Admin, SRE, CIO, Viewer, Capacity Manager, etc.]
-Screens / Pages     : [all screens or views]
-UI Components       : [all buttons, tabs, dropdowns, tables, modals, fields visible]
-User Flows          : [numbered list of every user flow]
-Acceptance Criteria : [numbered AC-1, AC-2, etc. — one per line]
-Business Rules      : [constraints, validations, permissions]
-Error / Edge States : [error messages, empty states, boundary conditions]
-
-========================================================
-STEP 2 — DUPLICATE CHECK AGAINST EXISTING TEST CASES
-========================================================
-
-Review the existing test cases provided in the user message.
-Do NOT generate any test case that duplicates an existing one.
-Only generate test cases for NEW gaps.
-
-========================================================
-STEP 3 — MANDATORY COVERAGE RULES
-========================================================
-
-Positive (min 40%): Happy path for every AC, every user flow, every role.
-
-Negative (min 20%): Missing required fields, invalid data, unauthorized access, wrong role.
-
-Edge Cases (MANDATORY min 30% — DO NOT SKIP THESE):
-- Empty state when no data exists
-- Maximum character limit on inputs
-- Special characters in input fields
-- Page refresh mid-flow
-- Browser back button during multi-step flow
-- Session expiry during active flow
-- Boundary value inputs
-- Simultaneous actions if applicable
-
-========================================================
-CRITICAL FIELD WRITING RULES — READ CAREFULLY
-========================================================
-
-PREREQUISITES — MUST be a numbered list with all three of:
-1. User role and login state (exact role name)
-2. Screen name or URL that must be accessible
-3. Specific test data conditions required
-
-CORRECT prerequisites:
-1. User is logged in with Capacity Manager role
-2. Multi-Cloud Capacity Dashboard is accessible
-3. Test data exists for OnPremise environment with at least 8 CI Types
-
-WRONG prerequisites (NEVER write like this):
-"User: ignio SRE logged in, Dashboard accessible, Multiple systems configured"
-
-─────────────────────────────────────────────────────
-
-TEST STEPS — MUST be numbered, one UI action per step:
-- Every step = exactly ONE UI action (click, type, select, hover, scroll, navigate)
-- Reference the EXACT UI element label as seen on screen
-- Always begin from navigation to the feature screen
-- Never combine two actions in one step
-
-CORRECT steps:
-1. Navigate to ignio application URL
-2. Click on "Capacity Management" from the main menu
-3. Verify Executive Dashboard loads successfully
-4. Click on "OnPremise" tab/section
-5. Wait for data to load
-
-WRONG steps (NEVER write like this):
-1. Log in to Ignio
-2. Navigate to dashboard
-3. Verify tiles displayed
-4. Confirm layout
-
-─────────────────────────────────────────────────────
-
-EXPECTED RESULT — MUST be multi-line with specific detail:
-- Line 1: The primary outcome (what happens)
-- Line 2+: Specific UI elements visible — exact column names, button labels, message text, counts, data values
-- For negative cases: include the EXACT error message text
-
-CORRECT expected result:
-OnPremise view loads successfully.
-CI Type table displays with columns: CI TYPE, NO OF SYSTEMS, RISK, POSSIBLE RISK, OPTIMIZATION, HEALTHY.
-OnPremise specific CI types are shown (Windows, Linux, CiscoRouter, etc.).
-Consolidation Duration shows current selection (PPM-RC3-701).
-
-WRONG expected result (NEVER write like this):
-"Ten system tiles displayed, each with system name, CPU usage, and memory usage"
-
-─────────────────────────────────────────────────────
-
-PRIORITY:
-High   → core user flows, AC-mapped scenarios, role-based access
-Medium → form validations, navigation flows, error messages
-Low    → edge cases, cosmetic states, boundary value inputs
-
-ABSOLUTELY FORBIDDEN:
-- Vague titles like "Test button" or "Check page loads"
-- Prerequisites as a single run-on sentence
-- Single-line vague expected results
-- Phrases like "works correctly", "saves successfully", "behaves as expected"
-- Missing edge cases (must be at least 30% of total)
-- Duplicate test cases
-
-========================================================
-OUTPUT FORMAT — JSON ONLY
-========================================================
-
-Return ONLY a valid JSON array. No markdown, no preamble, no text outside the array.
-
-[
-  {
-    "id": "TC-XXXX",
-    "title": "Verify [specific action] [specific condition]",
-    "prerequisites": "1. User is logged in with [Role] role\\n2. [Screen name] is accessible\\n3. [Specific test data condition]",
-    "steps": "1. Navigate to [URL/screen]\\n2. Click [exact element name]\\n3. [Action] [exact element]\\n4. [Action] [exact element]\\n5. Verify [specific outcome]",
-    "expected": "Primary outcome description.\\nSpecific UI element or column visible: [names].\\nExact message shown: '[message text]'.",
-    "type": "Positive",
-    "priority": "High",
-    "related_tc": "None"
-  }
-]
-
-type must be exactly one of: Positive, Negative, Edge
-priority must be exactly one of: High, Medium, Low
-"""
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# JSON PARSING — ROBUST MULTI-STRATEGY
+# JSON GENERATION — ROBUST WITH RETRY
 # ══════════════════════════════════════════════════════════════════════════════
 def parse_json_response(raw: str) -> list:
-    for attempt in [
-        lambda r: json.loads(r),
-        lambda r: json.loads(re.search(r'\[[\s\S]*\]', r).group()),
-        lambda r: json.loads(re.sub(r'```json|```', '', r).strip()),
-        lambda r: json.loads(re.search(r'\[[\s\S]*\]',
-                             re.sub(r',\s*}', '}', re.sub(r',\s*\]', ']', r))).group()),
-    ]:
-        try:
-            parsed = attempt(raw)
+    """Try multiple strategies to extract JSON array from AI response."""
+
+    # Strategy 1: Direct parse
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, list) and len(parsed) > 0:
+            return parsed
+    except Exception:
+        pass
+
+    # Strategy 2: Extract [...] block
+    try:
+        match = re.search(r'\[[\s\S]*\]', raw)
+        if match:
+            parsed = json.loads(match.group())
             if isinstance(parsed, list) and len(parsed) > 0:
                 return parsed
-        except Exception:
-            pass
+    except Exception:
+        pass
+
+    # Strategy 3: Strip markdown fences
+    try:
+        cleaned = re.sub(r'```json|```', '', raw).strip()
+        parsed  = json.loads(cleaned)
+        if isinstance(parsed, list) and len(parsed) > 0:
+            return parsed
+    except Exception:
+        pass
+
+    # Strategy 4: Fix common JSON issues (trailing commas, single quotes)
+    try:
+        cleaned = re.sub(r',\s*}', '}', raw)
+        cleaned = re.sub(r',\s*\]', ']', cleaned)
+        cleaned = re.sub(r"'", '"', cleaned)
+        match   = re.search(r'\[[\s\S]*\]', cleaned)
+        if match:
+            parsed = json.loads(match.group())
+            if isinstance(parsed, list) and len(parsed) > 0:
+                return parsed
+    except Exception:
+        pass
+
     return []
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# FEATURE UNDERSTANDING — CLAUDE
-# ══════════════════════════════════════════════════════════════════════════════
-def extract_feature_understanding(combined_text: str, api_key: str, image_blocks: list = None) -> str:
-    system = "You are a Senior QA Architect. Parse the feature input and return a structured FEATURE UNDERSTANDING."
-    user_text = f"""Parse this feature input and return EXACTLY in this format:
-
-Feature Name        : [name]
-User Roles          : [all user roles mentioned]
-Screens / Pages     : [all screens/pages]
-UI Components       : [all buttons, fields, dropdowns, tabs, tables]
-User Flows          : [numbered list of user flows]
-Acceptance Criteria : [numbered list — AC-1, AC-2, etc. — one per line]
-Business Rules      : [constraints, validations, permissions]
-Error / Edge States : [error messages, empty states, boundary conditions]
-Modules Affected    : [list all specific modules/templates]
-
-Feature Input:
-{combined_text}
-"""
-    content = [{"type": "text", "text": user_text}]
-    if image_blocks:
-        content.extend(image_blocks)
-    return call_claude(system, content, api_key, max_tokens=1500)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# TEST CASE GENERATION — CLAUDE WITH FULL CONTEXT + VISION
-# ══════════════════════════════════════════════════════════════════════════════
 def generate_test_cases_as_json(
     combined_text: str,
     feature_understanding: str,
@@ -407,17 +282,17 @@ def generate_test_cases_as_json(
     last_tc_id: int,
     api_key: str,
     include_neg: bool,
-    include_edge: bool,
-    image_blocks: list = None
+    include_edge: bool
 ) -> list:
+    """Generate test cases as JSON with retry on failure."""
 
     if include_neg and include_edge:
         pos  = max(1, int(num_cases * 0.40))
         edge = max(1, int(num_cases * 0.30))
         neg  = num_cases - pos - edge
     elif include_neg:
-        pos = num_cases // 2 + (num_cases % 2)
-        neg = num_cases - pos
+        pos  = num_cases // 2 + (num_cases % 2)
+        neg  = num_cases - pos
         edge = 0
     elif include_edge:
         pos  = max(1, int(num_cases * 0.60))
@@ -431,9 +306,9 @@ def generate_test_cases_as_json(
 
     if auto_mode:
         count_instruction = (
-            f"Generate as many test cases as needed for COMPLETE coverage of every AC, "
-            f"every user flow, every module, every error state, and ALL edge conditions. "
-            f"Minimum 30%% must be Edge type. TC IDs start from TC-{start_id:04d}."
+            f"Generate as many test cases as needed for COMPLETE coverage. "
+            f"Cover EVERY AC, EVERY user flow, EVERY module, EVERY error state, and ALL edge conditions. "
+            f"Minimum 30% must be Edge type. TC IDs start from TC-{start_id:04d}."
         )
     else:
         count_instruction = (
@@ -442,7 +317,7 @@ def generate_test_cases_as_json(
             f"TC IDs start from TC-{start_id:04d}."
         )
 
-    user_text = f"""{count_instruction}
+    prompt = f"""You are a Senior QA Architect. {count_instruction}
 
 ========================================================
 FEATURE UNDERSTANDING:
@@ -450,103 +325,187 @@ FEATURE UNDERSTANDING:
 {feature_understanding}
 
 ========================================================
-FULL FEATURE INPUT (use ALL of this, not just part of it):
+FULL FEATURE INPUT:
 ========================================================
 {combined_text}
 
 ========================================================
-EXISTING TEST CASES — DO NOT DUPLICATE ANY OF THESE:
+EXISTING TEST CASES — DO NOT DUPLICATE:
 ========================================================
 {similar_cases}
 
 ========================================================
-GENERATION INSTRUCTIONS:
+MANDATORY FIELD RULES — FOLLOW EXACTLY
 ========================================================
-- Auto-increment TC IDs from TC-{start_id:04d}
-- Do NOT duplicate any existing test case listed above
-- Prerequisites MUST be a numbered list:
-    1. Exact user role and login state
-    2. Screen name or URL
-    3. Specific test data conditions
-- Test Steps MUST be numbered, atomic, one UI action each, referencing exact UI element names
-- Expected Result MUST be multi-line with specific UI outcomes, column names, message text
-- Edge cases MUST be at least 30%% of total — include empty state, boundary values, session expiry, page refresh, browser back
-- Return ONLY the JSON array — no text before [ or after ]
+
+PREREQUISITES — Must be a NUMBERED LIST with all three:
+1. Exact user role and login state
+2. Screen name or URL that must be accessible
+3. Specific test data conditions required
+
+CORRECT example:
+1. User is logged in with Capacity Manager role
+2. Multi-Cloud Capacity Dashboard is accessible
+3. Test data exists for OnPremise environment with at least 8 CI Types
+
+WRONG (never write like this):
+"User: ignio SRE logged in, Dashboard accessible, Multiple systems configured"
+
+TEST STEPS — Must be NUMBERED, one UI action per step:
+- Every step = exactly ONE action (click, type, select, hover, scroll, navigate)
+- Reference the EXACT UI element label as seen on screen
+- Always start from navigation to the feature screen
+
+CORRECT example:
+1. Navigate to ignio application URL
+2. Click on "Capacity Management" from the main menu
+3. Verify Executive Dashboard loads successfully
+4. Click on "OnPremise" tab/section
+5. Wait for data to load
+
+WRONG (never write like this):
+1. Log in to Ignio
+2. Navigate to dashboard
+3. Verify tiles displayed
+
+EXPECTED RESULT — Must be MULTI-LINE and SPECIFIC:
+- Line 1: Primary outcome (what happens)
+- Line 2+: Specific UI elements, exact column names, button labels, message text, data values
+- For negative: include the EXACT error message text
+
+CORRECT example:
+OnPremise view loads successfully.
+CI Type table displays with columns: CI TYPE, NO OF SYSTEMS, RISK, POSSIBLE RISK, OPTIMIZATION, HEALTHY.
+OnPremise specific CI types are shown (Windows, Linux, CiscoRouter, etc.).
+
+WRONG (never write like this):
+"Ten system tiles displayed, each with system name, CPU usage, and memory usage"
+
+EDGE CASES — MANDATORY minimum 30% of total:
+- Empty state when no data exists
+- Maximum character limit on inputs
+- Special characters in input fields
+- Page refresh mid-flow
+- Browser back button during multi-step flow
+- Session expiry during active flow
+- Boundary value inputs
+
+PRIORITY:
+High   → core user flows, AC-mapped scenarios, role-based access
+Medium → form validations, navigation flows, error messages
+Low    → edge cases, cosmetic states, boundary value inputs
+
+FORBIDDEN:
+- Vague titles like "Test button" or "Check page loads"
+- Prerequisites as a single run-on sentence
+- Single-line vague expected results
+- "works correctly", "saves successfully", "behaves as expected"
+- Zero edge cases
+
+========================================================
+OUTPUT — RETURN ONLY A VALID JSON ARRAY
+========================================================
+
+No markdown, no text before [ or after ]. Start with [ and end with ].
+
+[
+  {{
+    "id": "TC-{start_id:04d}",
+    "title": "Verify user can switch to OnPremise cloud provider view",
+    "prerequisites": "1. User is logged in with Capacity Manager role\\n2. Multi-Cloud Capacity Dashboard is accessible\\n3. Test data exists for OnPremise environment",
+    "steps": "1. Navigate to ignio application URL\\n2. Click on \\"Capacity Management\\" from the main menu\\n3. Verify Executive Dashboard loads successfully\\n4. Click on \\"OnPremise\\" tab/section\\n5. Wait for data to load",
+    "expected": "OnPremise view loads successfully.\\nCI Type table displays with columns: CI TYPE, NO OF SYSTEMS, RISK, POSSIBLE RISK, OPTIMIZATION, HEALTHY.\\nOnPremise specific CI types are shown (Windows, Linux, CiscoRouter, etc.).",
+    "type": "Positive",
+    "priority": "High",
+    "related_tc": "None"
+  }},
+  {{
+    "id": "TC-{start_id+1:04d}",
+    "title": "Verify error handling when cloud provider has no data",
+    "prerequisites": "1. User is logged in with Capacity Manager role\\n2. Multi-Cloud Capacity Dashboard is accessible\\n3. Azure environment has no ingested data",
+    "steps": "1. Navigate to Multi-Cloud Capacity Dashboard\\n2. Click on \\"Azure\\" tab/section\\n3. Wait for system response\\n4. Verify page response for empty data state\\n5. Check that user can navigate back to other providers",
+    "expected": "System handles no data scenario gracefully.\\nAppropriate empty state message is displayed or table shows \\"No records found\\".\\nNo system errors or crashes occur.\\nUser can navigate back to other cloud providers.",
+    "type": "Negative",
+    "priority": "Medium",
+    "related_tc": "None"
+  }},
+  {{
+    "id": "TC-{start_id+2:04d}",
+    "title": "Verify page refresh mid-flow resets cloud provider selection",
+    "prerequisites": "1. User is logged in with SRE role\\n2. Multi-Cloud Capacity Dashboard is accessible\\n3. GCP environment has test data loaded",
+    "steps": "1. Navigate to Multi-Cloud Capacity Dashboard\\n2. Click on \\"GCP\\" tab/section\\n3. Wait for GCP data to load\\n4. Press F5 to refresh the browser page\\n5. Verify the dashboard state after refresh",
+    "expected": "Page refreshes and returns to default state.\\nDefault cloud provider view is shown (OnPremise or first tab).\\nNo data corruption or error messages appear.\\nUser can re-select GCP tab successfully.",
+    "type": "Edge",
+    "priority": "Low",
+    "related_tc": "None"
+  }}
+]
+
+Now generate ALL {num_cases if not auto_mode else 'required'} test cases for this feature.
+Return ONLY the JSON array. Do NOT truncate. Include ALL test cases.
 """
 
-    content = [{"type": "text", "text": user_text}]
-    if image_blocks:
-        content.extend(image_blocks)
-
-    raw    = call_claude(SYSTEM_PROMPT, content, api_key, max_tokens=8000)
+    raw    = call_groq(prompt, api_key, max_tokens=8000)
     result = parse_json_response(raw)
     if result:
         return result
 
-    # Retry — simpler prompt, still full text
-    retry_text = f"""Generate {num_cases} QA test cases as a JSON array for this feature.
+    # Retry with stricter shorter prompt
+    retry_prompt = f"""Generate {num_cases} QA test cases as a JSON array.
 
 Feature:
 {combined_text[:3000]}
 
-Rules:
+STRICT RULES:
 - TC IDs from TC-{start_id:04d}
-- Prerequisites: numbered list — 1. role  2. screen  3. test data
-- Steps: numbered, one UI action each, exact element names
-- Expected: multi-line, specific UI outcome with element names and message text
+- prerequisites: numbered list "1. role\\n2. screen\\n3. test data"
+- steps: numbered, one UI action each, exact element names from the feature
+- expected: multi-line, specific UI outcome with element names and message text
 - Types: {pos} Positive, {neg} Negative, {edge} Edge
-- Edge cases must cover: empty state, boundary value, session expiry, page refresh
+- Edge cases must cover empty state, boundary value, session expiry, page refresh
 
 Return ONLY the JSON array starting with [ and ending with ].
 """
-    raw    = call_claude(SYSTEM_PROMPT, retry_text, api_key, max_tokens=8000)
+    raw    = call_groq(retry_prompt, api_key, max_tokens=8000)
     return parse_json_response(raw)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# EXCEL BUILDER — MATCHES GITHUB COPILOT OUTPUT FORMAT
+# EXCEL BUILDER
 # ══════════════════════════════════════════════════════════════════════════════
 def build_excel(test_cases: list, feature_name: str) -> bytes:
-    wb      = openpyxl.Workbook()
-    h_fill  = PatternFill("solid", fgColor="1A1A2E")
-    h_font  = Font(bold=True, color="E8F4FD", name="Calibri", size=11)
+    wb     = openpyxl.Workbook()
+    h_fill = PatternFill("solid", fgColor="1A1A2E")
+    h_font = Font(bold=True, color="E8F4FD", name="Calibri", size=11)
     c_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
     pos_count  = sum(1 for tc in test_cases if "positive" in str(tc.get("type","")).lower())
     neg_count  = sum(1 for tc in test_cases if "negative" in str(tc.get("type","")).lower())
     edge_count = sum(1 for tc in test_cases if "edge"     in str(tc.get("type","")).lower())
 
-    # ── SUMMARY sheet ──────────────────────────────────────────────────────────
+    # Summary sheet
     ws_sum = wb.active
     ws_sum.title = "SUMMARY"
-    sum_hdrs = [
-        "Feature / Module Name", "Total Test Cases Generated", "Positive Count",
-        "Negative Count", "Edge Case Count", "Acceptance Criteria Covered", "Gaps Identified"
-    ]
-    sum_widths = [30, 24, 14, 14, 14, 50, 45]
-    for c, (h, w) in enumerate(zip(sum_hdrs, sum_widths), 1):
+    sum_hdrs = ["Feature / Module Name","Total Test Cases","Positive Count",
+                "Negative Count","Edge Case Count","Acceptance Criteria Covered","Gaps Identified"]
+    for c, h in enumerate(sum_hdrs, 1):
         cell = ws_sum.cell(row=1, column=c, value=h)
         cell.fill = h_fill; cell.font = h_font; cell.alignment = c_align
-        ws_sum.column_dimensions[get_column_letter(c)].width = w
-
+        ws_sum.column_dimensions[get_column_letter(c)].width = 22
     ws_sum.cell(row=2, column=1, value=feature_name)
     ws_sum.cell(row=2, column=2, value=len(test_cases))
     ws_sum.cell(row=2, column=3, value=pos_count)
     ws_sum.cell(row=2, column=4, value=neg_count)
     ws_sum.cell(row=2, column=5, value=edge_count)
-    ws_sum.cell(row=2, column=6, value="Extracted from Acceptance Criteria in feature input")
-    ws_sum.cell(row=2, column=7, value="Performance testing under load, Cross-browser compatibility")
-    for c in range(1, 8):
-        ws_sum.cell(row=2, column=c).alignment = Alignment(wrap_text=True, vertical="top")
-        ws_sum.cell(row=2, column=c).font = Font(name="Calibri", size=10)
+    ws_sum.cell(row=2, column=6, value="Extracted from feature input")
+    ws_sum.cell(row=2, column=7, value="Legacy system integration, Performance testing")
     ws_sum.freeze_panes = "A2"
 
-    # ── Test case sheet ────────────────────────────────────────────────────────
-    safe_name = re.sub(r'[\\/*?:\[\]]', '', feature_name)[:31]
-    ws      = wb.create_sheet(title=safe_name)
-    tc_hdrs = ["Test Case ID", "Test Case Title", "Prerequisites",
-               "Test Steps", "Expected Result", "Test Type", "Priority", "Related TC ID"]
-    widths  = [14, 38, 40, 55, 52, 12, 10, 14]
+    # Test case sheet
+    ws = wb.create_sheet(title=feature_name[:31])
+    tc_hdrs = ["Test Case ID","Test Case Title","Prerequisites",
+               "Test Steps","Expected Result","Test Type","Priority","Related TC ID"]
+    widths  = [14, 35, 32, 55, 42, 12, 10, 14]
 
     pos_fill  = PatternFill("solid", fgColor="E2EFDA")
     neg_fill  = PatternFill("solid", fgColor="FCE4D6")
@@ -555,11 +514,11 @@ def build_excel(test_cases: list, feature_name: str) -> bytes:
     neg_alt   = PatternFill("solid", fgColor="F0D0B8")
     edge_alt  = PatternFill("solid", fgColor="EFE8AA")
 
-    n_font  = Font(name="Calibri", size=10)
-    l_align = Alignment(horizontal="left",   vertical="top", wrap_text=True)
-    m_align = Alignment(horizontal="center", vertical="top", wrap_text=True)
-    thin    = Side(style="thin", color="CCCCCC")
-    bdr     = Border(left=thin, right=thin, top=thin, bottom=thin)
+    n_font   = Font(name="Calibri", size=10)
+    l_align  = Alignment(horizontal="left",   vertical="top", wrap_text=True)
+    m_align  = Alignment(horizontal="center", vertical="top", wrap_text=True)
+    thin     = Side(style="thin", color="CCCCCC")
+    bdr      = Border(left=thin, right=thin, top=thin, bottom=thin)
 
     for c, (h, w) in enumerate(zip(tc_hdrs, widths), 1):
         cell = ws.cell(row=1, column=c, value=h)
@@ -572,8 +531,8 @@ def build_excel(test_cases: list, feature_name: str) -> bytes:
     for ri, tc in enumerate(test_cases, 2):
         tc_type = str(tc.get("type", "")).lower()
         is_alt  = ri % 2 == 0
-        fill    = (neg_alt  if is_alt else neg_fill)  if "negative" in tc_type else \
-                  (edge_alt if is_alt else edge_fill) if "edge"     in tc_type else \
+        fill    = (neg_alt if is_alt else neg_fill) if "negative" in tc_type else \
+                  (edge_alt if is_alt else edge_fill) if "edge" in tc_type else \
                   (pos_alt  if is_alt else pos_fill)
 
         values = [
@@ -589,8 +548,8 @@ def build_excel(test_cases: list, feature_name: str) -> bytes:
         for ci, val in enumerate(values, 1):
             cell = ws.cell(row=ri, column=ci, value=val)
             cell.font = n_font; cell.border = bdr; cell.fill = fill
-            cell.alignment = m_align if ci in [1, 6, 7, 8] else l_align
-        ws.row_dimensions[ri].height = 90
+            cell.alignment = m_align if ci in [1,6,7,8] else l_align
+        ws.row_dimensions[ri].height = 80
 
     buf = io.BytesIO()
     wb.save(buf)
@@ -598,14 +557,14 @@ def build_excel(test_cases: list, feature_name: str) -> bytes:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# UI — IDENTICAL LAYOUT TO ORIGINAL APP
+# UI
 # ══════════════════════════════════════════════════════════════════════════════
 st.markdown("""
 <div class="app-header">
     <div class="app-title">QA Test Case Generator</div>
-    <div class="app-sub">Copilot-quality enterprise test cases — Claude AI + RAG + JSON pipeline</div>
+    <div class="app-sub">Copilot-quality enterprise test cases — Groq AI + RAG + JSON pipeline</div>
     <div style="margin-top:0.8rem">
-        <span class="tag">CLAUDE AI</span><span class="tag">OCR</span>
+        <span class="tag">GROQ AI</span><span class="tag">OCR</span>
         <span class="tag">RAG</span><span class="tag">JSON PIPELINE</span><span class="tag">EXCEL EXPORT</span>
     </div>
 </div>
@@ -615,10 +574,10 @@ st.markdown("""
 with st.sidebar:
 
     st.markdown('<div class="sidebar-section">', unsafe_allow_html=True)
-    st.markdown('<div class="sidebar-title">🔑 Anthropic API Key</div>', unsafe_allow_html=True)
-    api_key = st.text_input("Anthropic API Key", type="password",
-                            placeholder="Paste your sk-ant-... key", label_visibility="hidden")
-    st.caption("Get your key → [console.anthropic.com](https://console.anthropic.com)")
+    st.markdown('<div class="sidebar-title">🔑 Groq API Key</div>', unsafe_allow_html=True)
+    api_key = st.text_input("Groq API Key", type="password",
+                            placeholder="Paste your gsk_... key", label_visibility="hidden")
+    st.caption("Free key → [console.groq.com](https://console.groq.com)")
     st.markdown('</div>', unsafe_allow_html=True)
 
     st.markdown('<div class="sidebar-section">', unsafe_allow_html=True)
@@ -645,8 +604,8 @@ with st.sidebar:
     st.markdown('<div class="sidebar-title">🎛️ Settings</div>', unsafe_allow_html=True)
     auto_mode    = st.toggle("🤖 Auto — generate ALL scenarios", value=False)
     if auto_mode:
-        num_cases = 999
-        st.caption("Claude will generate as many test cases as needed to cover all scenarios")
+        num_cases = 999  # signals auto mode — AI decides count
+        st.caption("AI will generate as many test cases as needed to cover all scenarios")
     else:
         num_cases = st.number_input("Number of test cases", min_value=5, max_value=500, value=15, step=5)
         st.caption(f"Will generate {num_cases} test cases")
@@ -670,13 +629,14 @@ col_left, col_right = st.columns([1, 1], gap="large")
 with col_left:
     st.markdown('<div class="card-label">📤 Feature Input</div>', unsafe_allow_html=True)
 
+    # ── Input type selector ────────────────────────────────────────────────────
     tab_img, tab_doc, tab_txt = st.tabs(["🖼️ Images", "📄 Documents (.docx/.txt)", "📝 Text / Jira Story"])
 
     with tab_img:
         st.markdown("""
         <div class="info-box">
-            💡 <strong>Tip:</strong> Claude reads images directly — UI screenshots, wireframes, and mockups
-            are passed to Claude for visual understanding. No text extraction needed.
+            💡 <strong>Tip:</strong> If your image has embedded diagrams or very small text,
+            OCR may not extract it well. In that case, also paste the description in the Text tab.
         </div>
         """, unsafe_allow_html=True)
         images = st.file_uploader(
@@ -710,19 +670,24 @@ with col_left:
             placeholder="""Paste your Jira story, acceptance criteria, VD link description, or feature description here.
 
 Example:
-Feature: Multi-Cloud Capacity Management Dashboard
-As a Capacity Manager, I want to view capacity across cloud providers.
+Feature: Year Format Changes in Templates
+As ignio admin, I want all templates to display dates in new year format.
 
 Acceptance Criteria:
-AC-1: User can switch between OnPremise, AWS, GCP, Azure views
-AC-2: CI Type table shows CI TYPE, NO OF SYSTEMS, RISK, POSSIBLE RISK, OPTIMIZATION, HEALTHY
-AC-3: Pagination shows correct record count
-AC-4: SRE Dashboard shows forecast view with utilization data
+1. Incident report template shows date in new format
+2. Email notification template uses new format
+3. CSV and Excel exports maintain new format
+4. Dashboard filters display new format
+5. System rejects invalid year formats with error
 
-User Roles: Capacity Manager, SRE, Viewer""",
+Modules: incident report, dashboard, email, CSV export,
+Excel export, PDF export, alert template, rule mining
+
+User Roles: ignio admin, regular user""",
             label_visibility="hidden"
         )
 
+    # VD Link input
     st.markdown("**🔗 Or paste a VD / Figma / Confluence link:**")
     vd_link = st.text_input(
         "VD Link",
@@ -739,13 +704,14 @@ User Roles: Capacity Manager, SRE, Viewer""",
 
     st.markdown("")
 
-    has_image = bool(images)
-    has_doc   = bool(doc_files)
-    has_text  = bool(manual_text and manual_text.strip())
-    has_input = has_image or has_doc or has_text
-    can_run   = has_input and bool(api_key)
+    # Determine what input we have
+    has_image   = bool(images)
+    has_doc     = bool(doc_files)
+    has_text    = bool(manual_text and manual_text.strip())
+    has_input   = has_image or has_doc or has_text
+    can_run     = has_input and bool(api_key)
 
-    if not api_key:     st.caption("🔑 Add your Anthropic API key in the sidebar")
+    if not api_key:     st.caption("🔑 Add your Groq API key in the sidebar")
     elif not has_input: st.caption("⬆️ Upload images, documents, or paste text above")
 
     # ── GENERATE BUTTON ────────────────────────────────────────────────────────
@@ -753,34 +719,26 @@ User Roles: Capacity Manager, SRE, Viewer""",
 
         combined_text = ""
         ocr_warnings  = []
-        image_blocks  = []  # Claude vision content blocks
 
-        # ── Stage 1: Extract text + build image blocks ─────────────────────────
+        # ── Stage 1: Extract text from all inputs ──────────────────────────────
         st.session_state.stage = 1
 
+        # From images
         if has_image:
-            with st.spinner("🔍 Processing images for Claude vision..."):
+            with st.spinner("🔍 Extracting text from images..."):
                 for img_file in images:
-                    # Pass image directly to Claude (vision) — no OCR dependency
-                    img_file.seek(0)
-                    img_bytes  = img_file.read()
-                    ext        = img_file.name.rsplit(".", 1)[-1].lower()
-                    media_map  = {"jpg":"image/jpeg","jpeg":"image/jpeg","png":"image/png",
-                                  "webp":"image/webp","bmp":"image/png"}
-                    media_type = media_map.get(ext, "image/png")
-                    b64        = base64.standard_b64encode(img_bytes).decode("utf-8")
-                    image_blocks.append({
-                        "type": "image",
-                        "source": {"type": "base64", "media_type": media_type, "data": b64}
-                    })
-                    # Also run OCR as supplementary text context
-                    img_file.seek(0)
-                    pil_img    = Image.open(img_file)
-                    text, warns = run_ocr(pil_img)
+                    img          = Image.open(img_file)
+                    text, warns  = run_ocr(img)
                     ocr_warnings.extend(warns)
                     if text:
                         combined_text += f"\n\n[From image: {img_file.name}]\n{text}"
+                    else:
+                        ocr_warnings.append(
+                            f"⚠️ No text extracted from '{img_file.name}'. "
+                            f"Please paste the content manually in the Text tab."
+                        )
 
+        # From documents
         if has_doc:
             with st.spinner("📄 Reading document files..."):
                 for doc_file in doc_files:
@@ -799,13 +757,15 @@ User Roles: Capacity Manager, SRE, Viewer""",
                         if text:
                             combined_text += f"\n\n[From file: {doc_file.name}]\n{text}"
 
+        # From manual text
         if has_text:
             combined_text += f"\n\n[Feature Description]\n{manual_text.strip()}"
 
         combined_text = combined_text.strip()
         st.session_state.ocr_warnings = ocr_warnings
 
-        if not combined_text and not image_blocks:
+        # If no text extracted from any source
+        if not combined_text:
             st.error("""
 ❌ Could not extract any text from your inputs.
 
@@ -817,7 +777,8 @@ User Roles: Capacity Manager, SRE, Viewer""",
 """)
             st.stop()
 
-        if len(combined_text) < 50 and not image_blocks:
+        # If text is too short — warn but continue
+        if len(combined_text) < 50:
             st.warning(
                 "⚠️ Very little text was extracted. Results may be generic. "
                 "Consider adding more detail in the Text tab."
@@ -825,13 +786,27 @@ User Roles: Capacity Manager, SRE, Viewer""",
 
         st.session_state.extracted_text = combined_text
 
-        # ── Stage 2: Feature Understanding via Claude ──────────────────────────
+        # ── Stage 2: Feature Understanding ────────────────────────────────────
         st.session_state.stage = 2
         with st.spinner("🧠 Parsing feature and extracting acceptance criteria..."):
-            feature_understanding = extract_feature_understanding(
-                combined_text, api_key,
-                image_blocks if image_blocks else None
-            )
+            fu_prompt = f"""You are a Senior QA Architect.
+Parse this feature input and produce a FEATURE UNDERSTANDING.
+
+Return EXACTLY in this format:
+Feature Name        : [name]
+User Roles          : [all user roles mentioned]
+Screens / Pages     : [all screens/pages]
+UI Components       : [all buttons, fields, dropdowns, tabs]
+User Flows          : [numbered list of user flows]
+Acceptance Criteria : [numbered list — one per line]
+Business Rules      : [constraints, validations, permissions]
+Error / Edge States : [error messages, boundary conditions]
+Modules Affected    : [list all specific modules/templates]
+
+Feature Input:
+{combined_text}
+"""
+            feature_understanding = call_groq(fu_prompt, api_key, max_tokens=1000)
             st.session_state.feature_understand = feature_understanding
 
         # ── Stage 3: RAG ──────────────────────────────────────────────────────
@@ -839,11 +814,11 @@ User Roles: Capacity Manager, SRE, Viewer""",
         with st.spinner("📚 Retrieving similar past test cases..."):
             similar = rag_retrieve(feature_understanding)
 
-        # ── Stage 4: Generate Test Cases via Claude ────────────────────────────
+        # ── Stage 4: Generate JSON ─────────────────────────────────────────────
         st.session_state.stage = 4
         last_tc_id = st.session_state.last_tc_id or 3000
 
-        with st.spinner("⚙️ Generating Copilot-quality test cases (30–60 seconds)..."):
+        with st.spinner(f"⚙️ Generating test cases — covering all scenarios (this may take 30-60 seconds)..."):
             test_cases = generate_test_cases_as_json(
                 combined_text         = combined_text,
                 feature_understanding = feature_understanding,
@@ -853,7 +828,6 @@ User Roles: Capacity Manager, SRE, Viewer""",
                 api_key               = api_key,
                 include_neg           = include_neg,
                 include_edge          = include_edge,
-                image_blocks          = image_blocks if image_blocks else None,
             )
 
             if not test_cases:
@@ -862,7 +836,8 @@ User Roles: Capacity Manager, SRE, Viewer""",
 
 **Possible causes:**
 - Feature description is too short or unclear
-- API rate limit hit — wait 30 seconds and try again
+- Groq API rate limit hit — wait 30 seconds and try again
+- Try again — sometimes Groq needs a retry
 
 **What to do:** Add more detail to your feature description and try again.
 """)
@@ -878,8 +853,8 @@ User Roles: Capacity Manager, SRE, Viewer""",
         st.session_state.stage = 5
         with st.spinner("📊 Building formatted Excel with color coding..."):
             feature_name = "Feature"
-            if images:       feature_name = os.path.splitext(images[0].name)[0]
-            elif doc_files:  feature_name = os.path.splitext(doc_files[0].name)[0]
+            if images:        feature_name = os.path.splitext(images[0].name)[0]
+            elif doc_files:   feature_name = os.path.splitext(doc_files[0].name)[0]
             elif manual_text:
                 first = manual_text.strip().split("\n")[0]
                 feature_name = first[:30].replace("Feature:","").strip() or "Feature"
@@ -893,6 +868,7 @@ User Roles: Capacity Manager, SRE, Viewer""",
 with col_right:
     st.markdown('<div class="card-label">📋 Results</div>', unsafe_allow_html=True)
 
+    # Show OCR warnings if any
     if st.session_state.ocr_warnings:
         for w in st.session_state.ocr_warnings:
             st.markdown(f'<div class="warn-box">{w}</div>', unsafe_allow_html=True)
@@ -929,9 +905,9 @@ with col_right:
             preview = "\n\n".join(
                 f"{tc.get('id','')} | {tc.get('type','')} | {tc.get('priority','')}\n"
                 f"Title: {tc.get('title','')}\n"
-                f"Prerequisites:\n{tc.get('prerequisites','')}\n"
+                f"Prerequisites: {tc.get('prerequisites','')}\n"
                 f"Steps:\n{tc.get('steps','')}\n"
-                f"Expected:\n{tc.get('expected','')}"
+                f"Expected: {tc.get('expected','')}"
                 for tc in tcs[:5]
             ) + (f"\n\n... and {len(tcs)-5} more test cases in Excel" if len(tcs) > 5 else "")
             st.markdown(f'<div class="result-preview">{preview}</div>', unsafe_allow_html=True)
@@ -945,7 +921,7 @@ with col_right:
         st.markdown("---")
 
         fname = "Feature"
-        if images:      fname = os.path.splitext(images[0].name)[0]
+        if images:        fname = os.path.splitext(images[0].name)[0]
         elif st.session_state.test_cases_parsed:
             fname = st.session_state.test_cases_parsed[0].get("id","Feature").split("-")[0] + "_Feature"
 
