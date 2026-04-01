@@ -287,187 +287,118 @@ def generate_test_cases_as_json(
     """Generate test cases as JSON with retry on failure."""
 
     if include_neg and include_edge:
-        pos  = max(1, int(num_cases * 0.40))
-        edge = max(1, int(num_cases * 0.30))
-        neg  = num_cases - pos - edge
+        pos = num_cases // 3 + (num_cases % 3)
+        neg = num_cases // 3
+        edge = num_cases - pos - neg
     elif include_neg:
-        pos  = num_cases // 2 + (num_cases % 2)
-        neg  = num_cases - pos
+        pos = num_cases // 2 + (num_cases % 2)
+        neg = num_cases - pos
         edge = 0
     elif include_edge:
-        pos  = max(1, int(num_cases * 0.60))
+        pos = num_cases // 2 + (num_cases % 2)
+        neg = 0
         edge = num_cases - pos
-        neg  = 0
     else:
         pos, neg, edge = num_cases, 0, 0
 
-    start_id  = last_tc_id + 1
+    start_id = last_tc_id + 1
+
+    # Auto mode — let AI decide how many
     auto_mode = (num_cases == 999)
 
+    # Build the prompt
     if auto_mode:
-        count_instruction = (
-            f"Generate as many test cases as needed for COMPLETE coverage. "
-            f"Cover EVERY AC, EVERY user flow, EVERY module, EVERY error state, and ALL edge conditions. "
-            f"Minimum 30% must be Edge type. TC IDs start from TC-{start_id:04d}."
-        )
+        count_instruction = """Generate as many test cases as needed to achieve COMPLETE coverage.
+Do NOT limit yourself to any fixed number.
+Cover EVERY acceptance criterion, EVERY user flow, EVERY module mentioned,
+EVERY error state, and ALL boundary/edge conditions.
+Typical complete coverage = 40 to 80 test cases for a feature with multiple modules."""
+        num_display = "ALL scenarios (complete coverage)"
     else:
-        count_instruction = (
-            f"Generate exactly {num_cases} test cases: "
-            f"{pos} Positive + {neg} Negative + {edge} Edge. "
-            f"TC IDs start from TC-{start_id:04d}."
-        )
+        count_instruction = f"Generate exactly {num_cases} test cases ({pos} Positive + {neg} Negative + {edge} Edge)."
+        num_display = str(num_cases)
 
     prompt = f"""You are a Senior QA Architect. {count_instruction}
 
-========================================================
 FEATURE UNDERSTANDING:
-========================================================
 {feature_understanding}
 
-========================================================
-FULL FEATURE INPUT:
-========================================================
-{combined_text}
-
-========================================================
-EXISTING TEST CASES — DO NOT DUPLICATE:
-========================================================
+PAST TEST CASES STYLE REFERENCE (match this quality):
 {similar_cases}
 
-========================================================
-MANDATORY FIELD RULES — FOLLOW EXACTLY
-========================================================
+RULES:
+- Cover ALL scenarios from the feature understanding
+- Types: Positive / Negative / Edge (balance them appropriately)
+- TC IDs start from TC-{start_id:04d}
+- Prerequisites: specific role, module, test data
+- Steps: exactly 5, each a single specific UI action on a named element
+- Expected: exact visible UI outcome — screen name, message text, element state
+- NEVER use: "works correctly", "saves successfully", "behaves as expected"
 
-PREREQUISITES — Must be a NUMBERED LIST with all three:
-1. Exact user role and login state
-2. Screen name or URL that must be accessible
-3. Specific test data conditions required
-
-CORRECT example:
-1. User is logged in with Capacity Manager role
-2. Multi-Cloud Capacity Dashboard is accessible
-3. Test data exists for OnPremise environment with at least 8 CI Types
-
-WRONG (never write like this):
-"User: ignio SRE logged in, Dashboard accessible, Multiple systems configured"
-
-TEST STEPS — Must be NUMBERED, one UI action per step:
-- Every step = exactly ONE action (click, type, select, hover, scroll, navigate)
-- Reference the EXACT UI element label as seen on screen
-- Always start from navigation to the feature screen
-
-CORRECT example:
-1. Navigate to ignio application URL
-2. Click on "Capacity Management" from the main menu
-3. Verify Executive Dashboard loads successfully
-4. Click on "OnPremise" tab/section
-5. Wait for data to load
-
-WRONG (never write like this):
-1. Log in to Ignio
-2. Navigate to dashboard
-3. Verify tiles displayed
-
-EXPECTED RESULT — Must be MULTI-LINE and SPECIFIC:
-- Line 1: Primary outcome (what happens)
-- Line 2+: Specific UI elements, exact column names, button labels, message text, data values
-- For negative: include the EXACT error message text
-
-CORRECT example:
-OnPremise view loads successfully.
-CI Type table displays with columns: CI TYPE, NO OF SYSTEMS, RISK, POSSIBLE RISK, OPTIMIZATION, HEALTHY.
-OnPremise specific CI types are shown (Windows, Linux, CiscoRouter, etc.).
-
-WRONG (never write like this):
-"Ten system tiles displayed, each with system name, CPU usage, and memory usage"
-
-EDGE CASES — MANDATORY minimum 30% of total:
-- Empty state when no data exists
-- Maximum character limit on inputs
-- Special characters in input fields
-- Page refresh mid-flow
-- Browser back button during multi-step flow
-- Session expiry during active flow
-- Boundary value inputs
-
-PRIORITY:
-High   → core user flows, AC-mapped scenarios, role-based access
-Medium → form validations, navigation flows, error messages
-Low    → edge cases, cosmetic states, boundary value inputs
-
-FORBIDDEN:
-- Vague titles like "Test button" or "Check page loads"
-- Prerequisites as a single run-on sentence
-- Single-line vague expected results
-- "works correctly", "saves successfully", "behaves as expected"
-- Zero edge cases
-
-========================================================
-OUTPUT — RETURN ONLY A VALID JSON ARRAY
-========================================================
-
-No markdown, no text before [ or after ]. Start with [ and end with ].
+RETURN ONLY a valid JSON array. Nothing else before or after.
 
 [
   {{
     "id": "TC-{start_id:04d}",
-    "title": "Verify user can switch to OnPremise cloud provider view",
-    "prerequisites": "1. User is logged in with Capacity Manager role\\n2. Multi-Cloud Capacity Dashboard is accessible\\n3. Test data exists for OnPremise environment",
-    "steps": "1. Navigate to ignio application URL\\n2. Click on \\"Capacity Management\\" from the main menu\\n3. Verify Executive Dashboard loads successfully\\n4. Click on \\"OnPremise\\" tab/section\\n5. Wait for data to load",
-    "expected": "OnPremise view loads successfully.\\nCI Type table displays with columns: CI TYPE, NO OF SYSTEMS, RISK, POSSIBLE RISK, OPTIMIZATION, HEALTHY.\\nOnPremise specific CI types are shown (Windows, Linux, CiscoRouter, etc.).",
+    "title": "Verify year format in incident report template displays correctly",
+    "prerequisites": "User: ignio admin logged in, Incident report template accessible, Test data with date Jan 23 2026 available",
+    "steps": "1. Navigate to incident management system\\n2. Open existing incident with date Jan 23 2026\\n3. Generate incident report using standard template\\n4. Review date format in generated report\\n5. Verify year displays in new required format",
+    "expected": "Incident report displays date in correct year format. Template adheres to new standard. No formatting errors visible.",
     "type": "Positive",
     "priority": "High",
     "related_tc": "None"
   }},
   {{
     "id": "TC-{start_id+1:04d}",
-    "title": "Verify error handling when cloud provider has no data",
-    "prerequisites": "1. User is logged in with Capacity Manager role\\n2. Multi-Cloud Capacity Dashboard is accessible\\n3. Azure environment has no ingested data",
-    "steps": "1. Navigate to Multi-Cloud Capacity Dashboard\\n2. Click on \\"Azure\\" tab/section\\n3. Wait for system response\\n4. Verify page response for empty data state\\n5. Check that user can navigate back to other providers",
-    "expected": "System handles no data scenario gracefully.\\nAppropriate empty state message is displayed or table shows \\"No records found\\".\\nNo system errors or crashes occur.\\nUser can navigate back to other cloud providers.",
+    "title": "Verify system rejects invalid year format with error message",
+    "prerequisites": "User: ignio admin logged in, Template configuration screen accessible",
+    "steps": "1. Navigate to template configuration screen\\n2. Locate the year format input field\\n3. Enter invalid year format e.g. 3-digit year '202'\\n4. Click Save button\\n5. Verify error message appears on screen",
+    "expected": "System displays error message 'Invalid year format. Please use the required format.' Save is blocked. Field is highlighted in red.",
     "type": "Negative",
-    "priority": "Medium",
-    "related_tc": "None"
-  }},
-  {{
-    "id": "TC-{start_id+2:04d}",
-    "title": "Verify page refresh mid-flow resets cloud provider selection",
-    "prerequisites": "1. User is logged in with SRE role\\n2. Multi-Cloud Capacity Dashboard is accessible\\n3. GCP environment has test data loaded",
-    "steps": "1. Navigate to Multi-Cloud Capacity Dashboard\\n2. Click on \\"GCP\\" tab/section\\n3. Wait for GCP data to load\\n4. Press F5 to refresh the browser page\\n5. Verify the dashboard state after refresh",
-    "expected": "Page refreshes and returns to default state.\\nDefault cloud provider view is shown (OnPremise or first tab).\\nNo data corruption or error messages appear.\\nUser can re-select GCP tab successfully.",
-    "type": "Edge",
-    "priority": "Low",
+    "priority": "High",
     "related_tc": "None"
   }}
 ]
 
-Now generate ALL {num_cases if not auto_mode else 'required'} test cases for this feature.
-Return ONLY the JSON array. Do NOT truncate. Include ALL test cases.
+Now generate test cases for this feature (cover ALL scenarios completely):
+{combined_text[:800]}
+
+Return ONLY the JSON array starting with [ and ending with ].
+Do NOT truncate. Include ALL test cases.
 """
 
+    # First attempt
     raw    = call_groq(prompt, api_key, max_tokens=8000)
     result = parse_json_response(raw)
+
     if result:
         return result
 
-    # Retry with stricter shorter prompt
-    retry_prompt = f"""Generate {num_cases} QA test cases as a JSON array.
+    # Retry with simpler prompt
+    retry_prompt = f"""Generate {num_cases} test cases as a JSON array.
 
-Feature:
-{combined_text[:3000]}
+Feature: {combined_text[:400]}
 
-STRICT RULES:
-- TC IDs from TC-{start_id:04d}
-- prerequisites: numbered list "1. role\\n2. screen\\n3. test data"
-- steps: numbered, one UI action each, exact element names from the feature
-- expected: multi-line, specific UI outcome with element names and message text
-- Types: {pos} Positive, {neg} Negative, {edge} Edge
-- Edge cases must cover empty state, boundary value, session expiry, page refresh
-
-Return ONLY the JSON array starting with [ and ending with ].
+Return ONLY this JSON format, no other text:
+[
+  {{
+    "id": "TC-{start_id:04d}",
+    "title": "test case title",
+    "prerequisites": "User: role logged in, module accessible, test data available",
+    "steps": "1. Navigate to page\\n2. Click element\\n3. Enter value\\n4. Submit\\n5. Verify result",
+    "expected": "Exact visible UI outcome with screen name and message text",
+    "type": "Positive",
+    "priority": "High",
+    "related_tc": "None"
+  }}
+]
+Generate {num_cases} objects. Types: {pos} Positive, {neg} Negative, {edge} Edge.
+Start IDs from TC-{start_id:04d}.
 """
     raw    = call_groq(retry_prompt, api_key, max_tokens=8000)
-    return parse_json_response(raw)
+    result = parse_json_response(raw)
+
+    return result
 
 
 # ══════════════════════════════════════════════════════════════════════════════
