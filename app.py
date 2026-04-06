@@ -64,73 +64,114 @@ st.markdown("""
 # ══════════════════════════════════════════════════════════════════════════════
 LLM_PROVIDERS = {
     "Groq — LLaMA 3.1 8B (fastest)": {
-        "provider" : "groq",
-        "model"    : "llama-3.1-8b-instant",
-        "key_hint" : "gsk_...",
-        "key_link" : "https://console.groq.com",
-        "limit"    : "14,400 req/day free",
-        "max_chars": 12000,
+        "provider"  : "groq",
+        "model"     : "llama-3.1-8b-instant",
+        "key_hint"  : "gsk_...",
+        "key_link"  : "https://console.groq.com",
+        "limit"     : "14,400 req/day free",
+        "max_chars" : 6000,       # ← reduced from 12000
+        "ctx_window": 8192,
     },
     "Groq — LLaMA 3.3 70B (smarter)": {
-        "provider" : "groq",
-        "model"    : "llama-3.3-70b-versatile",
-        "key_hint" : "gsk_...",
-        "key_link" : "https://console.groq.com",
-        "limit"    : "1,000 req/day free",
-        "max_chars": 16000,
+        "provider"  : "groq",
+        "model"     : "llama-3.3-70b-versatile",
+        "key_hint"  : "gsk_...",
+        "key_link"  : "https://console.groq.com",
+        "limit"     : "1,000 req/day free",
+        "max_chars" : 8000,       # ← reduced from 16000
+        "ctx_window": 32768,
     },
     "Groq — Gemma 2 9B": {
-        "provider" : "groq",
-        "model"    : "gemma2-9b-it",
-        "key_hint" : "gsk_...",
-        "key_link" : "https://console.groq.com",
-        "limit"    : "14,400 req/day free",
-        "max_chars": 12000,
+        "provider"  : "groq",
+        "model"     : "gemma2-9b-it",
+        "key_hint"  : "gsk_...",
+        "key_link"  : "https://console.groq.com",
+        "limit"     : "14,400 req/day free",
+        "max_chars" : 6000,       # ← reduced from 12000
+        "ctx_window": 8192,
     },
     "Groq — Mixtral 8x7B": {
-        "provider" : "groq",
-        "model"    : "mixtral-8x7b-32768",
-        "key_hint" : "gsk_...",
-        "key_link" : "https://console.groq.com",
-        "limit"    : "14,400 req/day free",
-        "max_chars": 20000,
+        "provider"  : "groq",
+        "model"     : "mixtral-8x7b-32768",
+        "key_hint"  : "gsk_...",
+        "key_link"  : "https://console.groq.com",
+        "limit"     : "14,400 req/day free",
+        "max_chars" : 10000,      # ← reduced from 20000
+        "ctx_window": 32768,
     },
     "Together AI — LLaMA 3 8B (free tier)": {
-        "provider" : "together",
-        "model"    : "meta-llama/Llama-3-8b-chat-hf",
-        "key_hint" : "...",
-        "key_link" : "https://api.together.xyz",
-        "limit"    : "$25 free credits",
-        "max_chars": 12000,
+        "provider"  : "together",
+        "model"     : "meta-llama/Llama-3-8b-chat-hf",
+        "key_hint"  : "...",
+        "key_link"  : "https://api.together.xyz",
+        "limit"     : "$25 free credits",
+        "max_chars" : 6000,       # ← reduced from 12000
+        "ctx_window": 8192,
     },
 }
 
 
-def call_llm(prompt: str, api_key: str, provider_config: dict, max_tokens: int = 4000) -> str:
-    provider  = provider_config["provider"]
-    model     = provider_config["model"]
-    max_chars = provider_config.get("max_chars", 12000)
+# ══════════════════════════════════════════════════════════════════════════════
+# FIX: Robust token-safe LLM call with proper error handling
+# ══════════════════════════════════════════════════════════════════════════════
+def estimate_tokens(text: str) -> int:
+    """Rough estimate: 1 token ≈ 4 characters for English text."""
+    return len(text) // 4
 
-    # Trim prompt to avoid token-limit errors
+
+def call_llm(prompt: str, api_key: str, provider_config: dict, max_tokens: int = 4000) -> str:
+    provider   = provider_config["provider"]
+    model      = provider_config["model"]
+    max_chars  = provider_config.get("max_chars", 6000)
+    ctx_window = provider_config.get("ctx_window", 8192)
+
+    # ── Enforce hard character limit ──
     if len(prompt) > max_chars:
         prompt = prompt[:max_chars]
 
+    # ── Ensure prompt + max_tokens fits in context window ──
+    prompt_tokens = estimate_tokens(prompt)
+    safe_max_tokens = min(max_tokens, ctx_window - prompt_tokens - 200)   # 200 token buffer
+    if safe_max_tokens < 500:
+        # Prompt is still too big — aggressively trim
+        prompt = prompt[: (ctx_window - max_tokens - 200) * 4]
+        safe_max_tokens = max_tokens
+
+    # Guard against empty or whitespace-only prompts
+    if not prompt or not prompt.strip():
+        raise ValueError("Prompt is empty after trimming.")
+
     if provider == "groq":
-        client   = Groq(api_key=api_key)
-        response = client.chat.completions.create(
-            model       = model,
-            messages    = [{"role": "user", "content": prompt}],
-            max_tokens  = max_tokens,
-            temperature = 0.3,
-        )
-        return response.choices[0].message.content
+        try:
+            client   = Groq(api_key=api_key)
+            response = client.chat.completions.create(
+                model       = model,
+                messages    = [{"role": "user", "content": prompt}],
+                max_tokens  = safe_max_tokens,
+                temperature = 0.3,
+            )
+            return response.choices[0].message.content
+        except Exception as e:
+            err_msg = str(e).lower()
+            # If it's a token / length error, retry with a much shorter prompt
+            if any(kw in err_msg for kw in ["token", "length", "too long", "maximum", "context"]):
+                trimmed = prompt[: len(prompt) // 2]
+                client  = Groq(api_key=api_key)
+                response = client.chat.completions.create(
+                    model       = model,
+                    messages    = [{"role": "user", "content": trimmed}],
+                    max_tokens  = min(safe_max_tokens, 2000),
+                    temperature = 0.3,
+                )
+                return response.choices[0].message.content
+            raise   # re-raise non-token errors
 
     elif provider == "together":
         import urllib.request as ur
         body = json.dumps({
             "model"      : model,
             "messages"   : [{"role": "user", "content": prompt}],
-            "max_tokens" : max_tokens,
+            "max_tokens" : safe_max_tokens,
             "temperature": 0.3,
         }).encode()
         req = ur.Request(
@@ -147,8 +188,7 @@ def call_llm(prompt: str, api_key: str, provider_config: dict, max_tokens: int =
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# FIX 1 — SAFE EXCEL SHEET NAME
-# Prevents ValueError: Excel sheet names cannot contain : \ / ? * [ ]
+# SAFE EXCEL SHEET NAME
 # ══════════════════════════════════════════════════════════════════════════════
 def safe_sheet_name(name: str, fallback: str = "TestCases") -> str:
     if not name or not str(name).strip():
@@ -183,16 +223,16 @@ class SimpleVectorStore:
             return {"documents": [[]]}
         qe = query_embeddings[0]
         def cos(a, b):
-            d = sum(x*y for x,y in zip(a,b))
-            return d/(math.sqrt(sum(x*x for x in a))*math.sqrt(sum(x*x for x in b))+1e-9)
+            d = sum(x*y for x, y in zip(a, b))
+            return d / (math.sqrt(sum(x*x for x in a)) * math.sqrt(sum(x*x for x in b)) + 1e-9)
         scored = sorted(
-            [(cos(qe,e), d) for e,d in zip(self.embeddings, self.documents)],
+            [(cos(qe, e), d) for e, d in zip(self.embeddings, self.documents)],
             reverse=True
         )
-        return {"documents": [[d for _,d in scored[:n_results]]]}
+        return {"documents": [[d for _, d in scored[:n_results]]]}
 
     def clear(self):
-        self.documents=[]; self.embeddings=[]; self.ids=set()
+        self.documents = []; self.embeddings = []; self.ids = set()
 
 
 @st.cache_resource(show_spinner="Loading embedding model...")
@@ -243,7 +283,7 @@ def run_ocr(image: Image.Image) -> tuple:
     img = image.convert("RGB")
     w, h = img.size
     if w < 1000:
-        img = img.resize((1000, int(h*1000/w)), Image.LANCZOS)
+        img = img.resize((1000, int(h * 1000 / w)), Image.LANCZOS)
     img  = ImageEnhance.Contrast(img).enhance(2.0)
     img  = ImageEnhance.Sharpness(img).enhance(2.0)
     gray = img.convert("L")
@@ -282,39 +322,40 @@ def extract_txt_text(file_bytes: bytes) -> str:
 # RAG
 # ══════════════════════════════════════════════════════════════════════════════
 def load_excel_to_rag(excel_bytes: bytes) -> tuple:
-    embed=load_embed_model(); store=get_vector_store()
-    total=0; last_id=3000
-    wb=openpyxl.load_workbook(io.BytesIO(excel_bytes))
+    embed = load_embed_model(); store = get_vector_store()
+    total = 0; last_id = 3000
+    wb = openpyxl.load_workbook(io.BytesIO(excel_bytes))
     for sname in wb.sheetnames:
-        ws=wb[sname]
+        ws = wb[sname]
         if ws.max_row < 3: continue
-        headers=[str(c.value).strip().lower() if c.value else f"col{i}" for i,c in enumerate(ws[1])]
+        headers = [str(c.value).strip().lower() if c.value else f"col{i}" for i, c in enumerate(ws[1])]
         for row in ws.iter_rows(min_row=2, values_only=True):
             if not any(row): continue
-            for num in re.findall(r'\d+', str(row[0] or "")): last_id=max(last_id,int(num))
-            row_text="\n".join(f"{headers[i]}: {v}" for i,v in enumerate(row) if v is not None and i<len(headers))
+            for num in re.findall(r'\d+', str(row[0] or "")): last_id = max(last_id, int(num))
+            row_text = "\n".join(f"{headers[i]}: {v}" for i, v in enumerate(row) if v is not None and i < len(headers))
             if not row_text.strip(): continue
             st.session_state.rag_docs.append(row_text)
-            emb=embed.encode(row_text).tolist()
-            try: store.add([row_text],[emb],[f"tc_{sname}_{total}"]); total+=1
+            emb = embed.encode(row_text).tolist()
+            try: store.add([row_text], [emb], [f"tc_{sname}_{total}"]); total += 1
             except Exception: pass
-    st.session_state.rag_count=total; st.session_state.rag_loaded=True; st.session_state.last_tc_id=last_id
+    st.session_state.rag_count = total; st.session_state.rag_loaded = True; st.session_state.last_tc_id = last_id
     return total, last_id
 
 
 def rag_retrieve(query: str) -> str:
-    embed=load_embed_model(); store=get_vector_store()
-    if store.count()==0 and st.session_state.rag_docs:
-        for i,doc in enumerate(st.session_state.rag_docs):
-            emb=embed.encode(doc).tolist()
-            try: store.add([doc],[emb],[f"tc_r_{i}"])
+    embed = load_embed_model(); store = get_vector_store()
+    if store.count() == 0 and st.session_state.rag_docs:
+        for i, doc in enumerate(st.session_state.rag_docs):
+            emb = embed.encode(doc).tolist()
+            try: store.add([doc], [emb], [f"tc_r_{i}"])
             except Exception: pass
-    if store.count()==0: return "No past test cases loaded."
-    emb=embed.encode(query).tolist()
-    results=store.query([emb], n_results=min(5,store.count()))
-    docs=results["documents"][0] if results["documents"] else []
-    # FIX 2 — cap RAG context to prevent token overflow in prompt
-    return ("\n\n---\n\n".join(docs) if docs else "No similar cases found.")[:1200]
+    if store.count() == 0: return "No past test cases loaded."
+    emb = embed.encode(query[:300]).tolist()
+    results = store.query([emb], n_results=min(3, store.count()))
+    docs = results["documents"][0] if results["documents"] else []
+    # Cap RAG context strictly to prevent token overflow
+    combined = "\n---\n".join(docs) if docs else "No similar cases found."
+    return combined[:800]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -324,18 +365,18 @@ def parse_json_response(raw: str) -> list:
     for fn in [
         lambda s: json.loads(s),
         lambda s: json.loads(re.search(r'\[[\s\S]*\]', s).group()),
-        lambda s: json.loads(re.sub(r'```json|```','',s).strip()),
-        lambda s: json.loads(re.search(r'\[[\s\S]*\]', re.sub(r',\s*([}\]])',r'\1', re.sub(r"'",'"',s))).group()),
+        lambda s: json.loads(re.sub(r'```json|```', '', s).strip()),
+        lambda s: json.loads(re.search(r'\[[\s\S]*\]', re.sub(r',\s*([}\]])', r'\1', re.sub(r"'", '"', s))).group()),
     ]:
         try:
-            r=fn(raw)
-            if isinstance(r,list) and r: return r
+            r = fn(raw)
+            if isinstance(r, list) and r: return r
         except Exception: pass
     return []
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# FIX 2 — GENERATE TEST CASES with safe prompt sizes
+# GENERATE TEST CASES — with safe, compact prompts
 # ══════════════════════════════════════════════════════════════════════════════
 def generate_test_cases(combined_text, feature_understand, similar_cases,
                         num_cases, auto_mode, last_tc_id,
@@ -344,79 +385,86 @@ def generate_test_cases(combined_text, feature_understand, similar_cases,
     start_id = last_tc_id + 1
 
     if auto_mode:
-        count_rule = "Generate 20-30 test cases for complete coverage."
-        type_rule  = "40% Positive, 35% Negative, 25% Edge."
+        target_count = 20
+        type_rule    = "40% Positive, 35% Negative, 25% Edge."
     else:
+        target_count = num_cases
         if include_neg and include_edge:
-            pos=num_cases//3+(num_cases%3); neg=num_cases//3; edge=num_cases-pos-neg
+            pos = num_cases // 3 + (num_cases % 3); neg = num_cases // 3; edge = num_cases - pos - neg
         elif include_neg:
-            pos=num_cases//2+(num_cases%2); neg=num_cases-pos; edge=0
+            pos = num_cases // 2 + (num_cases % 2); neg = num_cases - pos; edge = 0
         elif include_edge:
-            pos=num_cases//2+(num_cases%2); neg=0; edge=num_cases-pos
+            pos = num_cases // 2 + (num_cases % 2); neg = 0; edge = num_cases - pos
         else:
-            pos,neg,edge=num_cases,0,0
-        count_rule = f"Generate exactly {num_cases} test cases."
-        type_rule  = f"{pos} Positive + {neg} Negative + {edge} Edge."
+            pos, neg, edge = num_cases, 0, 0
+        type_rule = f"{pos} Positive + {neg} Negative + {edge} Edge."
 
-    # Keep all inputs SHORT — this is the main fix for the Groq token error
-    fu  = feature_understand[:700]
-    ct  = combined_text[:500]
-    rag = similar_cases[:600]
+    # ── Keep ALL inputs SHORT — this is the critical fix ──
+    fu  = (feature_understand or "")[:500]
+    ct  = (combined_text or "")[:400]
+    rag = (similar_cases or "")[:400]
 
-    prompt = f"""You are a Senior QA Architect. {count_rule} Types: {type_rule}
+    prompt = f"""You are a Senior QA Architect. Generate exactly {target_count} test cases.
+Types: {type_rule}
 TC IDs start from TC-{start_id:04d}.
 
-FEATURE:
+FEATURE SUMMARY:
 {fu}
 
-SIMILAR PAST CASES (match this style):
+SIMILAR PAST CASES (match style):
 {rag}
 
-RULES (mandatory):
-- prerequisites: "User: [role] logged in, [module] accessible"
-- steps: numbered 1-5, each one UI action on a named element
-- expected: exact visible UI outcome with screen name and message
-- type: Positive or Negative or Edge
-- priority: High or Medium or Low
+RULES:
+- prerequisites: "User logged in, module accessible"
+- steps: numbered 1-5, each one UI action
+- expected: exact visible UI outcome
+- type: Positive / Negative / Edge
+- priority: High / Medium / Low
 - related_tc: None
 
 Return ONLY a valid JSON array. No text before [ or after ].
+Each object has keys: id, title, prerequisites, steps, expected, type, priority, related_tc
 
-Feature to test: {ct}
-"""
+Feature: {ct}"""
 
-    # Attempt 1
+    # ── Attempt 1 ──
     try:
-        raw = call_llm(prompt, api_key, provider_config, max_tokens=4000)
+        raw = call_llm(prompt, api_key, provider_config, max_tokens=3500)
         result = parse_json_response(raw)
-        if result: return result
+        if result:
+            return result
     except Exception as e:
-        st.warning(f"⚠️ Attempt 1 failed: {str(e)[:100]}. Retrying...")
+        st.warning(f"⚠️ Attempt 1 failed: {str(e)[:120]}. Retrying with shorter prompt...")
 
-    # Attempt 2 — even simpler
-    simple = f"""Generate {num_cases if not auto_mode else 15} QA test cases as JSON for:
-{ct[:300]}
+    # ── Attempt 2 — much simpler prompt ──
+    simple_count = min(target_count, 10)
+    simple = f"""Generate {simple_count} QA test cases as a JSON array.
+Feature: {ct[:250]}
+Each object needs: id (start TC-{start_id:04d}), title, prerequisites, steps, expected, type (Positive/Negative/Edge), priority (High/Medium/Low), related_tc (None).
+Return ONLY JSON. Start with ["""
 
-Return ONLY JSON array with: id, title, prerequisites, steps, expected, type, priority, related_tc
-IDs from TC-{start_id:04d}. type=Positive/Negative/Edge. priority=High/Medium/Low.
-["""
     try:
-        raw = call_llm(simple, api_key, provider_config, max_tokens=4000)
-        raw = raw if raw.strip().startswith("[") else "[" + raw
+        raw = call_llm(simple, api_key, provider_config, max_tokens=3000)
+        if not raw.strip().startswith("["):
+            raw = "[" + raw
         result = parse_json_response(raw)
-        if result: return result
+        if result:
+            return result
     except Exception as e:
-        st.warning(f"⚠️ Attempt 2 failed: {str(e)[:100]}. Trying minimal prompt...")
+        st.warning(f"⚠️ Attempt 2 failed: {str(e)[:120]}. Trying minimal prompt...")
 
-    # Attempt 3 — ultra minimal
-    ultra = f"""Create 10 QA test cases as JSON array for: {ct[:200]}
-Keys needed: id(TC-{start_id:04d}+), title, prerequisites, steps, expected, type(Positive/Negative/Edge), priority(High/Medium/Low), related_tc(None)
+    # ── Attempt 3 — ultra minimal ──
+    ultra = f"""Create 5 QA test cases as JSON array for: {ct[:150]}
+Keys: id(TC-{start_id:04d}+), title, prerequisites, steps, expected, type(Positive/Negative/Edge), priority(High/Medium/Low), related_tc(None)
 ["""
+
     try:
-        raw = call_llm(ultra, api_key, provider_config, max_tokens=3000)
-        raw = raw if raw.strip().startswith("[") else "[" + raw
+        raw = call_llm(ultra, api_key, provider_config, max_tokens=2000)
+        if not raw.strip().startswith("["):
+            raw = "[" + raw
         result = parse_json_response(raw)
-        if result: return result
+        if result:
+            return result
     except Exception as e:
         st.error(f"❌ All 3 attempts failed. Last error: {str(e)[:150]}")
 
@@ -435,63 +483,69 @@ def build_excel(test_cases: list, feature_name: str) -> bytes:
     thin   = Side(style="thin", color="CCCCCC")
     bdr    = Border(left=thin, right=thin, top=thin, bottom=thin)
 
-    pos_c  = sum(1 for t in test_cases if "positive" in str(t.get("type","")).lower())
-    neg_c  = sum(1 for t in test_cases if "negative" in str(t.get("type","")).lower())
-    edge_c = sum(1 for t in test_cases if "edge"     in str(t.get("type","")).lower())
+    pos_c  = sum(1 for t in test_cases if "positive" in str(t.get("type", "")).lower())
+    neg_c  = sum(1 for t in test_cases if "negative" in str(t.get("type", "")).lower())
+    edge_c = sum(1 for t in test_cases if "edge"     in str(t.get("type", "")).lower())
 
     # SUMMARY
     ws_s = wb.active; ws_s.title = "SUMMARY"
-    for c, h in enumerate(["Feature / Module Name","Total Test Cases","Positive Count",
-                            "Negative Count","Edge Case Count","ACs Covered","Gaps"], 1):
-        cell=ws_s.cell(row=1, column=c, value=h)
-        cell.fill=h_fill; cell.font=h_font; cell.alignment=ca
-        ws_s.column_dimensions[get_column_letter(c)].width=22
-    ws_s.cell(row=2,column=1,value=feature_name)
-    ws_s.cell(row=2,column=2,value=len(test_cases))
-    ws_s.cell(row=2,column=3,value=pos_c)
-    ws_s.cell(row=2,column=4,value=neg_c)
-    ws_s.cell(row=2,column=5,value=edge_c)
-    ws_s.cell(row=2,column=6,value="Extracted from feature input")
-    ws_s.cell(row=2,column=7,value="Legacy integration, Performance")
-    ws_s.freeze_panes="A2"
+    for c, h in enumerate(["Feature / Module Name", "Total Test Cases", "Positive Count",
+                            "Negative Count", "Edge Case Count", "ACs Covered", "Gaps"], 1):
+        cell = ws_s.cell(row=1, column=c, value=h)
+        cell.fill = h_fill; cell.font = h_font; cell.alignment = ca
+        ws_s.column_dimensions[get_column_letter(c)].width = 22
+    ws_s.cell(row=2, column=1, value=feature_name)
+    ws_s.cell(row=2, column=2, value=len(test_cases))
+    ws_s.cell(row=2, column=3, value=pos_c)
+    ws_s.cell(row=2, column=4, value=neg_c)
+    ws_s.cell(row=2, column=5, value=edge_c)
+    ws_s.cell(row=2, column=6, value="Extracted from feature input")
+    ws_s.cell(row=2, column=7, value="Legacy integration, Performance")
+    ws_s.freeze_panes = "A2"
 
-    # TEST CASES — safe_sheet_name prevents the ValueError crash
+    # TEST CASES
     ws = wb.create_sheet(title=safe_sheet_name(feature_name, "TestCases"))
 
-    hdrs   = ["Test Case ID","Test Case Title","Prerequisites","Test Steps",
-              "Expected Result","Test Type","Priority","Related TC ID"]
+    hdrs   = ["Test Case ID", "Test Case Title", "Prerequisites", "Test Steps",
+              "Expected Result", "Test Type", "Priority", "Related TC ID"]
     widths = [14, 35, 32, 55, 42, 12, 10, 14]
     fills  = {
-        "pos" :PatternFill("solid",fgColor="E2EFDA"),
-        "posa":PatternFill("solid",fgColor="D0E8C5"),
-        "neg" :PatternFill("solid",fgColor="FCE4D6"),
-        "nega":PatternFill("solid",fgColor="F0D0B8"),
-        "edg" :PatternFill("solid",fgColor="FFF2CC"),
-        "edga":PatternFill("solid",fgColor="EFE8AA"),
+        "pos" : PatternFill("solid", fgColor="E2EFDA"),
+        "posa": PatternFill("solid", fgColor="D0E8C5"),
+        "neg" : PatternFill("solid", fgColor="FCE4D6"),
+        "nega": PatternFill("solid", fgColor="F0D0B8"),
+        "edg" : PatternFill("solid", fgColor="FFF2CC"),
+        "edga": PatternFill("solid", fgColor="EFE8AA"),
     }
 
-    for c,(h,w) in enumerate(zip(hdrs,widths),1):
-        cell=ws.cell(row=1,column=c,value=h)
-        cell.fill=h_fill; cell.font=h_font; cell.alignment=ca; cell.border=bdr
-        ws.column_dimensions[get_column_letter(c)].width=w
-    ws.row_dimensions[1].height=30
-    ws.freeze_panes="A2"
+    for c, (h, w) in enumerate(zip(hdrs, widths), 1):
+        cell = ws.cell(row=1, column=c, value=h)
+        cell.fill = h_fill; cell.font = h_font; cell.alignment = ca; cell.border = bdr
+        ws.column_dimensions[get_column_letter(c)].width = w
+    ws.row_dimensions[1].height = 30
+    ws.freeze_panes = "A2"
 
-    for ri,tc in enumerate(test_cases,2):
-        t=str(tc.get("type","")).lower(); alt=ri%2==0
-        if "negative" in t: fill=fills["nega"] if alt else fills["neg"]
-        elif "edge"   in t: fill=fills["edga"] if alt else fills["edg"]
-        else:               fill=fills["posa"] if alt else fills["pos"]
-        vals=[tc.get("id",f"TC-{3000+ri:04d}"),tc.get("title",""),
-              tc.get("prerequisites",""),tc.get("steps",""),tc.get("expected",""),
-              tc.get("type","Positive"),tc.get("priority","Medium"),tc.get("related_tc","None")]
-        for ci,val in enumerate(vals,1):
-            cell=ws.cell(row=ri,column=ci,value=val)
-            cell.font=Font(name="Calibri",size=10); cell.border=bdr; cell.fill=fill
-            cell.alignment=ca if ci in [1,6,7,8] else la
-        ws.row_dimensions[ri].height=80
+    for ri, tc in enumerate(test_cases, 2):
+        t = str(tc.get("type", "")).lower(); alt = ri % 2 == 0
+        if "negative" in t:   fill = fills["nega"] if alt else fills["neg"]
+        elif "edge"   in t:   fill = fills["edga"] if alt else fills["edg"]
+        else:                 fill = fills["posa"] if alt else fills["pos"]
 
-    buf=io.BytesIO(); wb.save(buf); return buf.getvalue()
+        # Safely convert steps to string
+        steps_val = tc.get("steps", "")
+        if isinstance(steps_val, list):
+            steps_val = "\n".join(str(s) for s in steps_val)
+
+        vals = [tc.get("id", f"TC-{3000+ri:04d}"), tc.get("title", ""),
+                tc.get("prerequisites", ""), steps_val, tc.get("expected", ""),
+                tc.get("type", "Positive"), tc.get("priority", "Medium"), tc.get("related_tc", "None")]
+        for ci, val in enumerate(vals, 1):
+            cell = ws.cell(row=ri, column=ci, value=str(val) if val is not None else "")
+            cell.font = Font(name="Calibri", size=10); cell.border = bdr; cell.fill = fill
+            cell.alignment = ca if ci in [1, 6, 7, 8] else la
+        ws.row_dimensions[ri].height = 80
+
+    buf = io.BytesIO(); wb.save(buf); return buf.getvalue()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -522,7 +576,7 @@ with st.sidebar:
     st.markdown('<div class="sidebar-section">', unsafe_allow_html=True)
     st.markdown('<div class="sidebar-title">📊 Existing Test Cases (RAG)</div>', unsafe_allow_html=True)
     st.caption("Upload master Excel → avoids duplicates")
-    past_excel = st.file_uploader("Upload existing test cases", type=["xlsx","xls"], label_visibility="hidden")
+    past_excel = st.file_uploader("Upload existing test cases", type=["xlsx", "xls"], label_visibility="hidden")
     if past_excel and not st.session_state.rag_loaded:
         with st.spinner("Loading into RAG..."):
             count, last_id = load_excel_to_rag(past_excel.read())
@@ -533,8 +587,8 @@ with st.sidebar:
         st.markdown('<div class="rag-warn">⚠️ Upload master Excel for better quality</div>', unsafe_allow_html=True)
     if st.session_state.rag_loaded:
         if st.button("🗑️ Clear RAG & Upload New"):
-            st.session_state.rag_loaded=False; st.session_state.rag_count=0
-            st.session_state.rag_docs=[]; st.session_state.last_tc_id=3000
+            st.session_state.rag_loaded = False; st.session_state.rag_count = 0
+            st.session_state.rag_docs = []; st.session_state.last_tc_id = 3000
             get_vector_store().clear(); st.rerun()
     st.markdown('</div>', unsafe_allow_html=True)
 
@@ -542,38 +596,38 @@ with st.sidebar:
     st.markdown('<div class="sidebar-title">🎛️ Settings</div>', unsafe_allow_html=True)
     auto_mode = st.toggle("🤖 Auto — generate ALL scenarios", value=False)
     if auto_mode:
-        num_cases=999
+        num_cases = 999
         st.markdown('<div class="info-box">AI generates 20-30 TCs for full coverage</div>', unsafe_allow_html=True)
     else:
         num_cases = st.number_input("Number of test cases", min_value=5, max_value=100, value=15, step=5)
     include_neg  = st.toggle("Include negative tests", value=True)
-    include_edge = st.toggle("Include edge cases",      value=True)
+    include_edge = st.toggle("Include edge cases",     value=True)
     st.markdown('</div>', unsafe_allow_html=True)
 
     st.markdown("---")
     st.markdown('<div class="sidebar-title">📋 Pipeline Status</div>', unsafe_allow_html=True)
-    stage=st.session_state.stage or 0
-    for i,label in enumerate(["🔍 Extract Text","🧠 Parse Feature","📚 RAG Search","⚙️ Generate JSON","📊 Build Excel"]):
-        color="#2E7D32" if i<stage else ("#1565C0" if i==stage and stage>0 else "#9B8EA0")
-        icon ="✅"      if i<stage else ("⏳"      if i==stage and stage>0 else "○")
+    stage = st.session_state.stage or 0
+    for i, label in enumerate(["🔍 Extract Text", "🧠 Parse Feature", "📚 RAG Search", "⚙️ Generate JSON", "📊 Build Excel"]):
+        color = "#2E7D32" if i < stage else ("#1565C0" if i == stage and stage > 0 else "#9B8EA0")
+        icon  = "✅"      if i < stage else ("⏳"      if i == stage and stage > 0 else "○")
         st.markdown(f'<div style="color:{color};font-size:0.85rem;padding:0.2rem 0;">{icon} {label}</div>', unsafe_allow_html=True)
 
-col_left, col_right = st.columns([1,1], gap="large")
+col_left, col_right = st.columns([1, 1], gap="large")
 
 with col_left:
     st.markdown('<div class="card-label">📤 Feature Input</div>', unsafe_allow_html=True)
-    tab_img, tab_doc, tab_txt = st.tabs(["🖼️ Images","📄 Documents","📝 Text / Jira Story"])
+    tab_img, tab_doc, tab_txt = st.tabs(["🖼️ Images", "📄 Documents", "📝 Text / Jira Story"])
 
     with tab_img:
         st.markdown('<div class="info-box">💡 If OCR fails, paste text in the Text tab.</div>', unsafe_allow_html=True)
-        images = st.file_uploader("Upload feature images", type=["jpg","jpeg","png","webp","bmp"],
+        images = st.file_uploader("Upload feature images", type=["jpg", "jpeg", "png", "webp", "bmp"],
                                   accept_multiple_files=True, label_visibility="hidden")
         if images:
             for img in images: st.image(img, caption=img.name, use_container_width=True)
 
     with tab_doc:
         st.markdown('<div class="info-box">💡 Supports .docx and .txt files.</div>', unsafe_allow_html=True)
-        doc_files = st.file_uploader("Upload .docx or .txt", type=["docx","txt"],
+        doc_files = st.file_uploader("Upload .docx or .txt", type=["docx", "txt"],
                                      accept_multiple_files=True, label_visibility="hidden")
 
     with tab_txt:
@@ -596,81 +650,72 @@ with col_left:
     elif not has_input: st.caption("⬆️ Upload images, documents, or paste text above")
 
     if st.button("⚡ GENERATE TEST CASES", disabled=not can_run):
-        combined_text=""; ocr_warnings=[]
+        combined_text = ""; ocr_warnings = []
 
         # Stage 1
-        st.session_state.stage=1
+        st.session_state.stage = 1
         if has_image:
             with st.spinner("🔍 Extracting text from images..."):
                 for img_file in images:
                     text, warns = run_ocr(Image.open(img_file))
                     ocr_warnings.extend(warns)
-                    combined_text += (f"\n\n[Image: {img_file.name}]\n{text}" if text
-                                      else "")
+                    combined_text += (f"\n\n[Image: {img_file.name}]\n{text}" if text else "")
                     if not text: ocr_warnings.append(f"⚠️ No text from '{img_file.name}'.")
 
         if has_doc:
             with st.spinner("📄 Reading documents..."):
                 for df in doc_files:
-                    raw=df.read()
-                    text=(extract_docx_text(raw) if df.name.endswith(".docx")
-                          else extract_txt_text(raw))
+                    raw = df.read()
+                    text = (extract_docx_text(raw) if df.name.endswith(".docx")
+                            else extract_txt_text(raw))
                     combined_text += (f"\n\n[Doc: {df.name}]\n{text}" if text else "")
                     if not text: ocr_warnings.append(f"⚠️ Could not extract from '{df.name}'.")
 
         if has_text:
             combined_text += f"\n\n[Feature Description]\n{manual_text.strip()}"
 
-        combined_text=combined_text.strip()
-        st.session_state.ocr_warnings=ocr_warnings
+        combined_text = combined_text.strip()
+        st.session_state.ocr_warnings = ocr_warnings
 
         if not combined_text:
             st.error("❌ No text extracted. Please paste content in the Text tab."); st.stop()
 
-        st.session_state.extracted_text=combined_text
+        st.session_state.extracted_text = combined_text
 
         # Determine feature name
-        feature_name="Feature"
-        if images:      feature_name=os.path.splitext(images[0].name)[0]
-        elif doc_files: feature_name=os.path.splitext(doc_files[0].name)[0]
+        feature_name = "Feature"
+        if images:      feature_name = os.path.splitext(images[0].name)[0]
+        elif doc_files: feature_name = os.path.splitext(doc_files[0].name)[0]
         elif manual_text:
-            fl=manual_text.strip().split("\n")[0]
-            feature_name=fl[:50].replace("Feature:","").strip() or "Feature"
-        st.session_state.feature_name=feature_name
+            fl = manual_text.strip().split("\n")[0]
+            feature_name = fl[:50].replace("Feature:", "").strip() or "Feature"
+        st.session_state.feature_name = feature_name
 
-        # Stage 2
-        st.session_state.stage=2
+        # Stage 2 — Feature understanding with SHORT input
+        st.session_state.stage = 2
         with st.spinner("🧠 Parsing feature..."):
-            fu_prompt=f"""Parse this feature input. Return structured FEATURE UNDERSTANDING.
+            fu_prompt = f"""Parse this feature input. Return structured understanding.
 
-Format:
-Feature Name        : [name]
-User Roles          : [roles]
-Screens / Pages     : [screens]
-UI Components       : [buttons, fields, tabs]
-Acceptance Criteria : [numbered list]
-Business Rules      : [rules]
-Error States        : [error messages]
+Feature Name, User Roles, Screens, UI Components, Acceptance Criteria, Business Rules, Error States.
 
-Feature Input:
-{combined_text[:1200]}
-"""
+Input:
+{combined_text[:800]}"""
             try:
-                feature_understand=call_llm(fu_prompt, api_key, provider_cfg, max_tokens=600)
+                feature_understand = call_llm(fu_prompt, api_key, provider_cfg, max_tokens=500)
             except Exception as e:
-                feature_understand=f"Feature Name: {feature_name}\nInput summary: {combined_text[:300]}"
-                st.warning(f"⚠️ Feature parsing error: {str(e)[:80]}")
-            st.session_state.feature_understand=feature_understand
+                feature_understand = f"Feature Name: {feature_name}\nInput summary: {combined_text[:200]}"
+                st.warning(f"⚠️ Feature parsing error: {str(e)[:80]}. Using raw input.")
+            st.session_state.feature_understand = feature_understand
 
         # Stage 3
-        st.session_state.stage=3
+        st.session_state.stage = 3
         with st.spinner("📚 Searching similar test cases..."):
-            similar=rag_retrieve(feature_understand)
+            similar = rag_retrieve(feature_understand[:200])
 
         # Stage 4
-        st.session_state.stage=4
+        st.session_state.stage = 4
         with st.spinner("⚙️ Generating test cases..."):
-            test_cases=generate_test_cases(
+            test_cases = generate_test_cases(
                 combined_text=combined_text, feature_understand=feature_understand,
                 similar_cases=similar, num_cases=num_cases, auto_mode=auto_mode,
                 last_tc_id=st.session_state.last_tc_id or 3000,
@@ -681,18 +726,18 @@ Feature Input:
                 st.error("❌ Could not generate test cases.\n\n"
                          "**Try:** Switch AI model in sidebar, reduce test case count, or wait 30s and retry.")
                 st.stop()
-            st.session_state.test_cases_parsed=test_cases
-            st.session_state.tc_count  =len(test_cases)
-            st.session_state.pos_count =sum(1 for t in test_cases if "positive" in t.get("type","").lower())
-            st.session_state.neg_count =sum(1 for t in test_cases if "negative" in t.get("type","").lower())
-            st.session_state.edge_count=sum(1 for t in test_cases if "edge"     in t.get("type","").lower())
-            st.session_state.llm_used  =selected_llm
+            st.session_state.test_cases_parsed = test_cases
+            st.session_state.tc_count   = len(test_cases)
+            st.session_state.pos_count  = sum(1 for t in test_cases if "positive" in t.get("type", "").lower())
+            st.session_state.neg_count  = sum(1 for t in test_cases if "negative" in t.get("type", "").lower())
+            st.session_state.edge_count = sum(1 for t in test_cases if "edge"     in t.get("type", "").lower())
+            st.session_state.llm_used   = selected_llm
 
         # Stage 5
-        st.session_state.stage=5
+        st.session_state.stage = 5
         with st.spinner("📊 Building Excel..."):
-            excel=build_excel(test_cases, feature_name)
-            st.session_state.excel_bytes=excel
+            excel = build_excel(test_cases, feature_name)
+            st.session_state.excel_bytes = excel
 
         st.rerun()
 
@@ -708,9 +753,9 @@ with col_right:
             <div style="margin-top:0.8rem;font-size:0.9rem;color:#9B8EA0;">
                 Results will appear here after generation</div></div>""", unsafe_allow_html=True)
     else:
-        tc=st.session_state.tc_count or 0; pos=st.session_state.pos_count or 0
-        neg=st.session_state.neg_count or 0; edge=st.session_state.edge_count or 0
-        rag=st.session_state.rag_count or 0; llm=st.session_state.llm_used or ""
+        tc = st.session_state.tc_count or 0; pos = st.session_state.pos_count or 0
+        neg = st.session_state.neg_count or 0; edge = st.session_state.edge_count or 0
+        rag = st.session_state.rag_count or 0; llm = st.session_state.llm_used or ""
         if llm: st.markdown(f'<span class="llm-badge">Generated by: {llm}</span>', unsafe_allow_html=True)
         st.markdown(f'<div class="success-box">✅ &nbsp; <strong>{tc} test cases generated!</strong></div>', unsafe_allow_html=True)
         st.markdown(f"""<div class="metric-strip">
@@ -720,15 +765,15 @@ with col_right:
             <div class="metric"><div class="metric-val">{rag}</div><div class="metric-lbl">📚 RAG</div></div>
         </div>""", unsafe_allow_html=True)
 
-        t1,t2,t3=st.tabs(["📊 Test Cases","🧠 Feature Understanding","🔍 Extracted Text"])
+        t1, t2, t3 = st.tabs(["📊 Test Cases", "🧠 Feature Understanding", "🔍 Extracted Text"])
         with t1:
-            tcs=st.session_state.test_cases_parsed
-            preview="\n\n".join(
-                f"{t.get('id','')} | {t.get('type','')} | {t.get('priority','')}\n"
-                f"Title: {t.get('title','')}\nPrerequisites: {t.get('prerequisites','')}\n"
-                f"Steps:\n{t.get('steps','')}\nExpected: {t.get('expected','')}"
+            tcs = st.session_state.test_cases_parsed
+            preview = "\n\n".join(
+                f"{t.get('id', '')} | {t.get('type', '')} | {t.get('priority', '')}\n"
+                f"Title: {t.get('title', '')}\nPrerequisites: {t.get('prerequisites', '')}\n"
+                f"Steps:\n{t.get('steps', '')}\nExpected: {t.get('expected', '')}"
                 for t in tcs[:5])
-            if len(tcs)>5: preview+=f"\n\n... and {len(tcs)-5} more in the Excel file"
+            if len(tcs) > 5: preview += f"\n\n... and {len(tcs)-5} more in the Excel file"
             st.markdown(f'<div class="result-preview">{preview}</div>', unsafe_allow_html=True)
         with t2:
             st.markdown(f'<div class="result-preview">{st.session_state.feature_understand or "—"}</div>', unsafe_allow_html=True)
@@ -736,7 +781,7 @@ with col_right:
             st.markdown(f'<div class="result-preview">{(st.session_state.extracted_text or "—")[:2000]}</div>', unsafe_allow_html=True)
 
         st.markdown("---")
-        fname=safe_sheet_name(st.session_state.feature_name or "Feature", "Feature")
+        fname = safe_sheet_name(st.session_state.feature_name or "Feature", "Feature")
         st.download_button(
             label="⬇️ DOWNLOAD EXCEL TEST CASES",
             data=st.session_state.excel_bytes,
@@ -744,7 +789,7 @@ with col_right:
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
         if st.button("🔄 Generate New"):
-            for k in ["extracted_text","feature_understand","test_cases_parsed","excel_bytes",
-                      "tc_count","pos_count","neg_count","edge_count","ocr_warnings","llm_used","feature_name"]:
-                st.session_state[k]=[] if k in ["test_cases_parsed","ocr_warnings"] else None
-            st.session_state.stage=0; st.rerun()
+            for k in ["extracted_text", "feature_understand", "test_cases_parsed", "excel_bytes",
+                      "tc_count", "pos_count", "neg_count", "edge_count", "ocr_warnings", "llm_used", "feature_name"]:
+                st.session_state[k] = [] if k in ["test_cases_parsed", "ocr_warnings"] else None
+            st.session_state.stage = 0; st.rerun()
