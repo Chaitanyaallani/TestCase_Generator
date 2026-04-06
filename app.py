@@ -69,7 +69,7 @@ LLM_PROVIDERS = {
         "key_hint"  : "gsk_...",
         "key_link"  : "https://console.groq.com",
         "limit"     : "14,400 req/day free",
-        "max_chars" : 6000,       # ← reduced from 12000
+        "max_chars" : 4000,
         "ctx_window": 8192,
     },
     "Groq — LLaMA 3.3 70B (smarter)": {
@@ -87,7 +87,7 @@ LLM_PROVIDERS = {
         "key_hint"  : "gsk_...",
         "key_link"  : "https://console.groq.com",
         "limit"     : "14,400 req/day free",
-        "max_chars" : 6000,       # ← reduced from 12000
+        "max_chars" : 4000,
         "ctx_window": 8192,
     },
     "Groq — Mixtral 8x7B": {
@@ -105,66 +105,76 @@ LLM_PROVIDERS = {
         "key_hint"  : "...",
         "key_link"  : "https://api.together.xyz",
         "limit"     : "$25 free credits",
-        "max_chars" : 6000,       # ← reduced from 12000
+        "max_chars" : 4000,
         "ctx_window": 8192,
     },
 }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# FIX: Robust token-safe LLM call with proper error handling
+# ROBUST LLM CALL — with hard token safety and auto-retry
 # ══════════════════════════════════════════════════════════════════════════════
-def estimate_tokens(text: str) -> int:
-    """Rough estimate: 1 token ≈ 4 characters for English text."""
-    return len(text) // 4
+def _trim_prompt(prompt: str, max_chars: int) -> str:
+    """Hard-trim prompt to max_chars, trying to cut at a newline."""
+    if len(prompt) <= max_chars:
+        return prompt
+    trimmed = prompt[:max_chars]
+    # Try to cut at last newline for cleaner break
+    last_nl = trimmed.rfind("\n")
+    if last_nl > max_chars // 2:
+        trimmed = trimmed[:last_nl]
+    return trimmed
 
 
 def call_llm(prompt: str, api_key: str, provider_config: dict, max_tokens: int = 4000) -> str:
     provider   = provider_config["provider"]
     model      = provider_config["model"]
-    max_chars  = provider_config.get("max_chars", 6000)
+    max_chars  = provider_config.get("max_chars", 4000)
     ctx_window = provider_config.get("ctx_window", 8192)
 
-    # ── Enforce hard character limit ──
-    if len(prompt) > max_chars:
-        prompt = prompt[:max_chars]
+    # ── STEP 1: Hard character limit ──
+    prompt = _trim_prompt(prompt, max_chars)
 
-    # ── Ensure prompt + max_tokens fits in context window ──
-    prompt_tokens = estimate_tokens(prompt)
-    safe_max_tokens = min(max_tokens, ctx_window - prompt_tokens - 200)   # 200 token buffer
-    if safe_max_tokens < 500:
-        # Prompt is still too big — aggressively trim
-        prompt = prompt[: (ctx_window - max_tokens - 200) * 4]
-        safe_max_tokens = max_tokens
+    # ── STEP 2: Calculate safe max_tokens ──
+    # Use conservative ratio: 1 token ≈ 3 chars (safer than 4)
+    estimated_prompt_tokens = len(prompt) // 3
+    # Reserve 300 tokens as safety buffer
+    available_for_output = ctx_window - estimated_prompt_tokens - 300
+    safe_max_tokens = max(500, min(max_tokens, available_for_output))
 
-    # Guard against empty or whitespace-only prompts
+    # If still over budget, trim prompt further
+    if available_for_output < 500:
+        max_prompt_tokens = ctx_window - max_tokens - 300
+        prompt = _trim_prompt(prompt, max(500, max_prompt_tokens * 3))
+        safe_max_tokens = min(max_tokens, 2000)
+
+    # Guard against empty prompt
     if not prompt or not prompt.strip():
         raise ValueError("Prompt is empty after trimming.")
 
     if provider == "groq":
-        try:
-            client   = Groq(api_key=api_key)
-            response = client.chat.completions.create(
-                model       = model,
-                messages    = [{"role": "user", "content": prompt}],
-                max_tokens  = safe_max_tokens,
-                temperature = 0.3,
-            )
-            return response.choices[0].message.content
-        except Exception as e:
-            err_msg = str(e).lower()
-            # If it's a token / length error, retry with a much shorter prompt
-            if any(kw in err_msg for kw in ["token", "length", "too long", "maximum", "context"]):
-                trimmed = prompt[: len(prompt) // 2]
-                client  = Groq(api_key=api_key)
+        client = Groq(api_key=api_key)
+
+        # Try up to 3 times, halving prompt each time on ANY error
+        last_error = None
+        for attempt in range(3):
+            try:
                 response = client.chat.completions.create(
                     model       = model,
-                    messages    = [{"role": "user", "content": trimmed}],
-                    max_tokens  = min(safe_max_tokens, 2000),
+                    messages    = [{"role": "user", "content": prompt}],
+                    max_tokens  = safe_max_tokens,
                     temperature = 0.3,
                 )
                 return response.choices[0].message.content
-            raise   # re-raise non-token errors
+            except Exception as e:
+                last_error = e
+                # Halve prompt and reduce max_tokens for next attempt
+                prompt = _trim_prompt(prompt, len(prompt) // 2)
+                safe_max_tokens = min(safe_max_tokens, 1500)
+                if not prompt.strip():
+                    break
+
+        raise last_error  # All 3 attempts failed
 
     elif provider == "together":
         import urllib.request as ur
@@ -355,7 +365,7 @@ def rag_retrieve(query: str) -> str:
     docs = results["documents"][0] if results["documents"] else []
     # Cap RAG context strictly to prevent token overflow
     combined = "\n---\n".join(docs) if docs else "No similar cases found."
-    return combined[:800]
+    return combined[:500]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -399,37 +409,28 @@ def generate_test_cases(combined_text, feature_understand, similar_cases,
             pos, neg, edge = num_cases, 0, 0
         type_rule = f"{pos} Positive + {neg} Negative + {edge} Edge."
 
-    # ── Keep ALL inputs SHORT — this is the critical fix ──
-    fu  = (feature_understand or "")[:500]
-    ct  = (combined_text or "")[:400]
-    rag = (similar_cases or "")[:400]
+    # ── Keep ALL inputs SHORT — critical for 8K context models ──
+    fu  = (feature_understand or "")[:350]
+    ct  = (combined_text or "")[:300]
+    rag = (similar_cases or "")[:300]
 
-    prompt = f"""You are a Senior QA Architect. Generate exactly {target_count} test cases.
-Types: {type_rule}
-TC IDs start from TC-{start_id:04d}.
+    prompt = f"""You are a QA Architect. Generate {target_count} test cases as JSON array.
+Types: {type_rule}. IDs start TC-{start_id:04d}.
 
-FEATURE SUMMARY:
+FEATURE:
 {fu}
 
-SIMILAR PAST CASES (match style):
+PAST CASES:
 {rag}
 
-RULES:
-- prerequisites: "User logged in, module accessible"
-- steps: numbered 1-5, each one UI action
-- expected: exact visible UI outcome
-- type: Positive / Negative / Edge
-- priority: High / Medium / Low
-- related_tc: None
+Keys per object: id, title, prerequisites, steps, expected, type(Positive/Negative/Edge), priority(High/Medium/Low), related_tc(None)
+Return ONLY valid JSON array. No text before [ or after ].
 
-Return ONLY a valid JSON array. No text before [ or after ].
-Each object has keys: id, title, prerequisites, steps, expected, type, priority, related_tc
-
-Feature: {ct}"""
+Feature to test: {ct}"""
 
     # ── Attempt 1 ──
     try:
-        raw = call_llm(prompt, api_key, provider_config, max_tokens=3500)
+        raw = call_llm(prompt, api_key, provider_config, max_tokens=2500)
         result = parse_json_response(raw)
         if result:
             return result
@@ -437,14 +438,29 @@ Feature: {ct}"""
         st.warning(f"⚠️ Attempt 1 failed: {str(e)[:120]}. Retrying with shorter prompt...")
 
     # ── Attempt 2 — much simpler prompt ──
-    simple_count = min(target_count, 10)
-    simple = f"""Generate {simple_count} QA test cases as a JSON array.
-Feature: {ct[:250]}
-Each object needs: id (start TC-{start_id:04d}), title, prerequisites, steps, expected, type (Positive/Negative/Edge), priority (High/Medium/Low), related_tc (None).
-Return ONLY JSON. Start with ["""
+    simple_count = min(target_count, 8)
+    simple = f"""Generate {simple_count} QA test cases as JSON array.
+Feature: {ct[:200]}
+Keys: id(TC-{start_id:04d}+), title, prerequisites, steps, expected, type(Positive/Negative/Edge), priority(High/Medium/Low), related_tc(None).
+Return ONLY JSON array starting with ["""
 
     try:
-        raw = call_llm(simple, api_key, provider_config, max_tokens=3000)
+        raw = call_llm(simple, api_key, provider_config, max_tokens=2000)
+        if not raw.strip().startswith("["):
+            raw = "[" + raw
+        result = parse_json_response(raw)
+        if result:
+            return result
+    except Exception as e:
+        st.warning(f"⚠️ Attempt 2 failed: {str(e)[:120]}. Trying minimal prompt...")
+
+    # ── Attempt 3 — ultra minimal ──
+    ultra = f"""Create 5 QA test cases as JSON array for: {ct[:120]}
+Keys: id(TC-{start_id:04d}+), title, prerequisites, steps, expected, type, priority, related_tc
+["""
+
+    try:
+        raw = call_llm(ultra, api_key, provider_config, max_tokens=1500)
         if not raw.strip().startswith("["):
             raw = "[" + raw
         result = parse_json_response(raw)
@@ -694,14 +710,12 @@ with col_left:
         # Stage 2 — Feature understanding with SHORT input
         st.session_state.stage = 2
         with st.spinner("🧠 Parsing feature..."):
-            fu_prompt = f"""Parse this feature input. Return structured understanding.
-
-Feature Name, User Roles, Screens, UI Components, Acceptance Criteria, Business Rules, Error States.
+            fu_prompt = f"""Parse this feature. List: Feature Name, User Roles, Screens, UI Components, Acceptance Criteria, Business Rules, Error States.
 
 Input:
-{combined_text[:800]}"""
+{combined_text[:500]}"""
             try:
-                feature_understand = call_llm(fu_prompt, api_key, provider_cfg, max_tokens=500)
+                feature_understand = call_llm(fu_prompt, api_key, provider_cfg, max_tokens=400)
             except Exception as e:
                 feature_understand = f"Feature Name: {feature_name}\nInput summary: {combined_text[:200]}"
                 st.warning(f"⚠️ Feature parsing error: {str(e)[:80]}. Using raw input.")
