@@ -7,8 +7,7 @@ from openpyxl.utils import get_column_letter
 from sentence_transformers import SentenceTransformer
 import io, os, re, json, math
 import zipfile
-import urllib.request
-import urllib.error
+import requests
 from xml.etree import ElementTree as ET
 
 # ── Page Config ────────────────────────────────────────────────────────────────
@@ -127,31 +126,32 @@ def _trim(text: str, max_chars: int) -> str:
 
 def _http_chat(api_url: str, api_key: str, model: str,
                prompt: str, max_tokens: int) -> str:
-    body = json.dumps({
-        "model"      : model,
-        "messages"   : [{"role": "user", "content": prompt}],
-        "max_tokens" : max_tokens,
-        "temperature": 0.3,
-    }).encode("utf-8")
-
-    req = urllib.request.Request(
-        api_url, data=body,
+    """Call an OpenAI-compatible chat API using the requests library."""
+    resp = requests.post(
+        api_url,
         headers={
             "Authorization": f"Bearer {api_key}",
             "Content-Type" : "application/json",
         },
-        method="POST",
+        json={
+            "model"      : model,
+            "messages"   : [{"role": "user", "content": prompt}],
+            "max_tokens" : max_tokens,
+            "temperature": 0.3,
+        },
+        timeout=120,
     )
 
-    try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-        return data["choices"][0]["message"]["content"]
-    except urllib.error.HTTPError as e:
-        err_body = ""
-        try: err_body = e.read().decode("utf-8", errors="replace")
-        except Exception: pass
-        raise RuntimeError(f"HTTP {e.code}: {err_body[:300]}") from e
+    if resp.status_code != 200:
+        # Extract useful error message from response body
+        try:
+            err_detail = resp.json().get("error", {}).get("message", resp.text[:300])
+        except Exception:
+            err_detail = resp.text[:300]
+        raise RuntimeError(f"HTTP {resp.status_code}: {err_detail}")
+
+    data = resp.json()
+    return data["choices"][0]["message"]["content"]
 
 
 def call_llm(prompt: str, api_key: str, provider_config: dict,
