@@ -66,7 +66,6 @@ st.markdown("""
 
 # ══════════════════════════════════════════════════════════════════════════════
 # LLM CONFIGURATION
-# All providers are FREE. Switch when one hits its rate limit.
 # ══════════════════════════════════════════════════════════════════════════════
 
 LLM_PROVIDERS = {
@@ -109,7 +108,7 @@ LLM_PROVIDERS = {
 
 
 def call_llm(prompt: str, api_key: str, provider_config: dict, max_tokens: int = 8000) -> str:
-    """Call whichever LLM provider is selected. All are free tier."""
+    """Call whichever LLM provider is selected."""
     provider = provider_config["provider"]
     model    = provider_config["model"]
 
@@ -142,14 +141,42 @@ def call_llm(prompt: str, api_key: str, provider_config: dict, max_tokens: int =
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# IN-MEMORY VECTOR STORE (replaces ChromaDB — works on Python 3.14)
+# HELPER — SAFE EXCEL SHEET NAME
+# Fixes ValueError from openpyxl when feature name contains illegal characters.
+# Excel sheet names cannot contain: : \ / ? * [ ]
+# Sheet names also cannot be empty, start/end with apostrophe, or exceed 31 chars.
+# ══════════════════════════════════════════════════════════════════════════════
+def safe_sheet_name(name: str, fallback: str = "TestCases") -> str:
+    """
+    Sanitise a string so it is a valid Excel worksheet name.
+    - Removes/replaces illegal characters: : \\ / ? * [ ]
+    - Strips leading/trailing spaces and apostrophes
+    - Truncates to 31 characters (Excel hard limit)
+    - Returns fallback if result is empty
+    """
+    if not name or not name.strip():
+        return fallback
+
+    # Replace every illegal Excel sheet-name character with underscore
+    sanitised = re.sub(r'[:\\/?*\[\]]', '_', name)
+
+    # Remove any leading/trailing whitespace and apostrophes
+    sanitised = sanitised.strip(" '")
+
+    # Collapse multiple consecutive underscores into one
+    sanitised = re.sub(r'_+', '_', sanitised)
+
+    # Truncate to Excel's 31-character sheet-name limit
+    sanitised = sanitised[:31].strip(" '_")
+
+    return sanitised if sanitised else fallback
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# IN-MEMORY VECTOR STORE
 # ══════════════════════════════════════════════════════════════════════════════
 
 class SimpleVectorStore:
-    """
-    Lightweight in-memory vector store using cosine similarity.
-    Drop-in replacement for ChromaDB — no dependencies, works everywhere.
-    """
     def __init__(self):
         self.documents  : list  = []
         self.embeddings : list  = []
@@ -230,7 +257,6 @@ def run_ocr(image: Image.Image) -> tuple:
         except Exception:
             return ""
 
-    # Preprocess: upscale + enhance contrast + grayscale
     img = image.convert("RGB")
     w, h = img.size
     if w < 1000:
@@ -327,7 +353,6 @@ def load_excel_to_rag(excel_bytes: bytes) -> tuple:
 def rag_retrieve(query: str) -> str:
     embed = load_embed_model()
     store = get_vector_store()
-    # Restore from session_state if store was cleared
     if store.count() == 0 and st.session_state.rag_docs:
         for i, doc in enumerate(st.session_state.rag_docs):
             emb = embed.encode(doc).tolist()
@@ -491,7 +516,6 @@ TC IDs start from TC-{start_id:04d}.
 [
 """
     raw    = call_llm(simple_prompt, api_key, provider_config, max_tokens=8000)
-    # Prepend the [ that we started with
     result = parse_json_response("[" + raw if not raw.strip().startswith("[") else raw)
     if result:
         return result
@@ -534,7 +558,12 @@ def build_excel(test_cases: list, feature_name: str) -> bytes:
     ws_s.freeze_panes = "A2"
 
     # ── TEST CASE SHEET ────────────────────────────────────────────────────────
-    ws = wb.create_sheet(title=feature_name[:31])
+    # FIX: Sanitise feature_name before using it as an Excel sheet name.
+    # Excel rejects sheet names containing: : \ / ? * [ ]
+    # and names longer than 31 characters.
+    sheet_title = safe_sheet_name(feature_name, fallback="TestCases")
+    ws = wb.create_sheet(title=sheet_title)
+
     tc_hdrs = ["Test Case ID","Test Case Title","Prerequisites",
                "Test Steps","Expected Result","Test Type","Priority","Related TC ID"]
     widths  = [14, 35, 32, 55, 42, 12, 10, 14]
@@ -609,7 +638,6 @@ st.markdown("""
 # ── SIDEBAR ───────────────────────────────────────────────────────────────────
 with st.sidebar:
 
-    # ── LLM PROVIDER ──────────────────────────────────────────────────────────
     st.markdown('<div class="sidebar-section">', unsafe_allow_html=True)
     st.markdown('<div class="sidebar-title">🤖 Select AI Model</div>', unsafe_allow_html=True)
     st.caption("Switch to another model if you hit the rate limit")
@@ -639,7 +667,6 @@ with st.sidebar:
     )
     st.markdown('</div>', unsafe_allow_html=True)
 
-    # ── RAG ───────────────────────────────────────────────────────────────────
     st.markdown('<div class="sidebar-section">', unsafe_allow_html=True)
     st.markdown('<div class="sidebar-title">📊 Existing Test Cases (RAG)</div>', unsafe_allow_html=True)
     st.caption("Upload master Excel → avoids duplicates, matches your company style")
@@ -675,7 +702,6 @@ with st.sidebar:
             st.rerun()
     st.markdown('</div>', unsafe_allow_html=True)
 
-    # ── SETTINGS ──────────────────────────────────────────────────────────────
     st.markdown('<div class="sidebar-section">', unsafe_allow_html=True)
     st.markdown('<div class="sidebar-title">🎛️ Settings</div>', unsafe_allow_html=True)
 
@@ -704,7 +730,6 @@ with st.sidebar:
     include_edge = st.toggle("Include edge cases",      value=True)
     st.markdown('</div>', unsafe_allow_html=True)
 
-    # ── PIPELINE STATUS ────────────────────────────────────────────────────────
     st.markdown("---")
     st.markdown('<div class="sidebar-title">📋 Pipeline Status</div>', unsafe_allow_html=True)
     stage = st.session_state.stage or 0
@@ -783,7 +808,6 @@ User Roles: ignio admin, regular user""",
             label_visibility = "hidden"
         )
 
-    # VD Link input
     st.markdown("**🔗 VD / Figma / Confluence link:**")
     vd_link = st.text_input("VD Link", placeholder="https://...", label_visibility="hidden")
     if vd_link:
@@ -809,7 +833,6 @@ User Roles: ignio admin, regular user""",
         combined_text = ""
         ocr_warnings  = []
 
-        # Stage 1: Extract text
         st.session_state.stage = 1
 
         if has_image:
@@ -857,7 +880,6 @@ User Roles: ignio admin, regular user""",
 
         st.session_state.extracted_text = combined_text
 
-        # Stage 2: Feature Understanding
         st.session_state.stage = 2
         with st.spinner("🧠 Parsing feature and extracting acceptance criteria..."):
             fu_prompt = f"""You are a Senior QA Architect.
@@ -880,12 +902,10 @@ Feature Input:
             feature_understand = call_llm(fu_prompt, api_key, provider_cfg, max_tokens=1000)
             st.session_state.feature_understand = feature_understand
 
-        # Stage 3: RAG
         st.session_state.stage = 3
         with st.spinner("📚 Retrieving similar past test cases..."):
             similar = rag_retrieve(feature_understand)
 
-        # Stage 4: Generate
         st.session_state.stage = 4
         last_tc_id = st.session_state.last_tc_id or 3000
         spin_msg = (
@@ -925,15 +945,18 @@ Feature Input:
             st.session_state.edge_count        = sum(1 for t in test_cases if "edge"     in t.get("type","").lower())
             st.session_state.llm_used          = selected_llm
 
-        # Stage 5: Excel
         st.session_state.stage = 5
         with st.spinner("📊 Building formatted Excel with color coding..."):
+            # FIX: Determine feature_name then sanitise it via safe_sheet_name
+            # before passing to build_excel so the sheet title is always valid.
             feature_name = "Feature"
-            if images:        feature_name = os.path.splitext(images[0].name)[0]
-            elif doc_files:   feature_name = os.path.splitext(doc_files[0].name)[0]
+            if images:
+                feature_name = os.path.splitext(images[0].name)[0]
+            elif doc_files:
+                feature_name = os.path.splitext(doc_files[0].name)[0]
             elif manual_text:
                 first        = manual_text.strip().split("\n")[0]
-                feature_name = first[:30].replace("Feature:","").strip() or "Feature"
+                feature_name = first[:50].replace("Feature:","").strip() or "Feature"
 
             excel = build_excel(test_cases, feature_name)
             st.session_state.excel_bytes = excel
@@ -1013,6 +1036,8 @@ with col_right:
         fname = "Feature"
         if st.session_state.test_cases_parsed:
             fname = st.session_state.feature_understand.split("\n")[0].replace("Feature Name :", "").strip()[:30] or "Feature"
+        # Sanitise download filename too
+        fname = safe_sheet_name(fname, fallback="Feature")
 
         st.download_button(
             label     = "⬇️ DOWNLOAD EXCEL TEST CASES",
