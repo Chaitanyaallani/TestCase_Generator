@@ -3,3 +3,4 @@ pytesseract
 Pillow
 openpyxl
 sentence-transformers
+requests
