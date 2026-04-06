@@ -1,5 +1,4 @@
 import streamlit as st
-from groq import Groq
 import pytesseract
 from PIL import Image, ImageEnhance
 import openpyxl
@@ -8,6 +7,8 @@ from openpyxl.utils import get_column_letter
 from sentence_transformers import SentenceTransformer
 import io, os, re, json, math
 import zipfile
+import urllib.request
+import urllib.error
 from xml.etree import ElementTree as ET
 
 # ── Page Config ────────────────────────────────────────────────────────────────
@@ -60,7 +61,9 @@ st.markdown("""
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# LLM PROVIDERS
+# LLM PROVIDERS — Updated April 2026
+# Removed DEPRECATED: gemma2-9b-it, mixtral-8x7b-32768
+# Added current models: qwen/qwen3-32b, llama-4-scout
 # ══════════════════════════════════════════════════════════════════════════════
 LLM_PROVIDERS = {
     "Groq — LLaMA 3.1 8B (fastest)": {
@@ -78,30 +81,30 @@ LLM_PROVIDERS = {
         "key_hint"  : "gsk_...",
         "key_link"  : "https://console.groq.com",
         "limit"     : "1,000 req/day free",
-        "max_chars" : 8000,       # ← reduced from 16000
+        "max_chars" : 8000,
         "ctx_window": 32768,
     },
-    "Groq — Gemma 2 9B": {
+    "Groq — Qwen 3 32B": {
         "provider"  : "groq",
-        "model"     : "gemma2-9b-it",
+        "model"     : "qwen/qwen3-32b",
         "key_hint"  : "gsk_...",
         "key_link"  : "https://console.groq.com",
         "limit"     : "14,400 req/day free",
-        "max_chars" : 4000,
-        "ctx_window": 8192,
+        "max_chars" : 8000,
+        "ctx_window": 32768,
     },
-    "Groq — Mixtral 8x7B": {
+    "Groq — LLaMA 4 Scout 17B": {
         "provider"  : "groq",
-        "model"     : "mixtral-8x7b-32768",
+        "model"     : "meta-llama/llama-4-scout-17b-16e-instruct",
         "key_hint"  : "gsk_...",
         "key_link"  : "https://console.groq.com",
         "limit"     : "14,400 req/day free",
-        "max_chars" : 10000,      # ← reduced from 20000
+        "max_chars" : 8000,
         "ctx_window": 32768,
     },
-    "Together AI — LLaMA 3 8B (free tier)": {
+    "Together AI — LLaMA 3.1 8B": {
         "provider"  : "together",
-        "model"     : "meta-llama/Llama-3-8b-chat-hf",
+        "model"     : "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo",
         "key_hint"  : "...",
         "key_link"  : "https://api.together.xyz",
         "limit"     : "$25 free credits",
@@ -112,89 +115,84 @@ LLM_PROVIDERS = {
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ROBUST LLM CALL — with hard token safety and auto-retry
+# RAW HTTP LLM CALL — No Groq SDK needed. Works with any OpenAI-compatible API.
 # ══════════════════════════════════════════════════════════════════════════════
-def _trim_prompt(prompt: str, max_chars: int) -> str:
-    """Hard-trim prompt to max_chars, trying to cut at a newline."""
-    if len(prompt) <= max_chars:
-        return prompt
-    trimmed = prompt[:max_chars]
-    # Try to cut at last newline for cleaner break
-    last_nl = trimmed.rfind("\n")
-    if last_nl > max_chars // 2:
-        trimmed = trimmed[:last_nl]
-    return trimmed
+def _trim(text: str, max_chars: int) -> str:
+    if len(text) <= max_chars:
+        return text
+    cut = text[:max_chars]
+    nl = cut.rfind("\n")
+    return cut[:nl] if nl > max_chars // 2 else cut
 
 
-def call_llm(prompt: str, api_key: str, provider_config: dict, max_tokens: int = 4000) -> str:
+def _http_chat(api_url: str, api_key: str, model: str,
+               prompt: str, max_tokens: int) -> str:
+    body = json.dumps({
+        "model"      : model,
+        "messages"   : [{"role": "user", "content": prompt}],
+        "max_tokens" : max_tokens,
+        "temperature": 0.3,
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        api_url, data=body,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type" : "application/json",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        return data["choices"][0]["message"]["content"]
+    except urllib.error.HTTPError as e:
+        err_body = ""
+        try: err_body = e.read().decode("utf-8", errors="replace")
+        except Exception: pass
+        raise RuntimeError(f"HTTP {e.code}: {err_body[:300]}") from e
+
+
+def call_llm(prompt: str, api_key: str, provider_config: dict,
+             max_tokens: int = 2500) -> str:
     provider   = provider_config["provider"]
     model      = provider_config["model"]
     max_chars  = provider_config.get("max_chars", 4000)
     ctx_window = provider_config.get("ctx_window", 8192)
 
-    # ── STEP 1: Hard character limit ──
-    prompt = _trim_prompt(prompt, max_chars)
+    api_url = ("https://api.groq.com/openai/v1/chat/completions"
+               if provider == "groq"
+               else "https://api.together.xyz/v1/chat/completions")
 
-    # ── STEP 2: Calculate safe max_tokens ──
-    # Use conservative ratio: 1 token ≈ 3 chars (safer than 4)
-    estimated_prompt_tokens = len(prompt) // 3
-    # Reserve 300 tokens as safety buffer
-    available_for_output = ctx_window - estimated_prompt_tokens - 300
-    safe_max_tokens = max(500, min(max_tokens, available_for_output))
+    # Hard-trim
+    prompt = _trim(prompt, max_chars)
 
-    # If still over budget, trim prompt further
-    if available_for_output < 500:
-        max_prompt_tokens = ctx_window - max_tokens - 300
-        prompt = _trim_prompt(prompt, max(500, max_prompt_tokens * 3))
-        safe_max_tokens = min(max_tokens, 2000)
+    # Fit inside context window (1 tok ≈ 3 chars, conservative)
+    est_prompt_tok = len(prompt) // 3
+    available = ctx_window - est_prompt_tok - 300
+    safe_max = max(400, min(max_tokens, available))
 
-    # Guard against empty prompt
-    if not prompt or not prompt.strip():
-        raise ValueError("Prompt is empty after trimming.")
+    if available < 400:
+        target = (ctx_window - max_tokens - 300) * 3
+        prompt = _trim(prompt, max(300, target))
+        safe_max = min(max_tokens, 1500)
 
-    if provider == "groq":
-        client = Groq(api_key=api_key)
+    if not prompt.strip():
+        raise ValueError("Empty prompt")
 
-        # Try up to 3 times, halving prompt each time on ANY error
-        last_error = None
-        for attempt in range(3):
-            try:
-                response = client.chat.completions.create(
-                    model       = model,
-                    messages    = [{"role": "user", "content": prompt}],
-                    max_tokens  = safe_max_tokens,
-                    temperature = 0.3,
-                )
-                return response.choices[0].message.content
-            except Exception as e:
-                last_error = e
-                # Halve prompt and reduce max_tokens for next attempt
-                prompt = _trim_prompt(prompt, len(prompt) // 2)
-                safe_max_tokens = min(safe_max_tokens, 1500)
-                if not prompt.strip():
-                    break
-
-        raise last_error  # All 3 attempts failed
-
-    elif provider == "together":
-        import urllib.request as ur
-        body = json.dumps({
-            "model"      : model,
-            "messages"   : [{"role": "user", "content": prompt}],
-            "max_tokens" : safe_max_tokens,
-            "temperature": 0.3,
-        }).encode()
-        req = ur.Request(
-            "https://api.together.xyz/v1/chat/completions",
-            data    = body,
-            headers = {"Authorization": f"Bearer {api_key}",
-                       "Content-Type": "application/json"},
-        )
-        with ur.urlopen(req, timeout=120) as resp:
-            data = json.loads(resp.read())
-        return data["choices"][0]["message"]["content"]
-
-    raise ValueError(f"Unknown provider: {provider}")
+    # Retry up to 3× on ANY error, halving prompt each time
+    last_err = None
+    for _ in range(3):
+        try:
+            return _http_chat(api_url, api_key, model, prompt, safe_max)
+        except Exception as e:
+            last_err = e
+            prompt = _trim(prompt, len(prompt) // 2)
+            safe_max = min(safe_max, 1200)
+            if len(prompt.strip()) < 50:
+                break
+    raise last_err
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -215,9 +213,9 @@ def safe_sheet_name(name: str, fallback: str = "TestCases") -> str:
 # ══════════════════════════════════════════════════════════════════════════════
 class SimpleVectorStore:
     def __init__(self):
-        self.documents : list = []
+        self.documents: list = []
         self.embeddings: list = []
-        self.ids       : set  = set()
+        self.ids: set = set()
 
     def add(self, documents, embeddings, ids):
         for doc, emb, id_ in zip(documents, embeddings, ids):
@@ -233,7 +231,7 @@ class SimpleVectorStore:
             return {"documents": [[]]}
         qe = query_embeddings[0]
         def cos(a, b):
-            d = sum(x*y for x, y in zip(a, b))
+            d = sum(x * y for x, y in zip(a, b))
             return d / (math.sqrt(sum(x*x for x in a)) * math.sqrt(sum(x*x for x in b)) + 1e-9)
         scored = sorted(
             [(cos(qe, e), d) for e, d in zip(self.embeddings, self.documents)],
@@ -258,22 +256,12 @@ def get_vector_store():
 # SESSION STATE
 # ══════════════════════════════════════════════════════════════════════════════
 DEFAULTS = {
-    "extracted_text"    : None,
-    "feature_understand": None,
-    "test_cases_parsed" : [],
-    "excel_bytes"       : None,
-    "stage"             : 0,
-    "tc_count"          : 0,
-    "pos_count"         : 0,
-    "neg_count"         : 0,
-    "edge_count"        : 0,
-    "rag_loaded"        : False,
-    "rag_count"         : 0,
-    "rag_docs"          : [],
-    "last_tc_id"        : 3000,
-    "ocr_warnings"      : [],
-    "llm_used"          : "",
-    "feature_name"      : "Feature",
+    "extracted_text": None, "feature_understand": None,
+    "test_cases_parsed": [], "excel_bytes": None, "stage": 0,
+    "tc_count": 0, "pos_count": 0, "neg_count": 0, "edge_count": 0,
+    "rag_loaded": False, "rag_count": 0, "rag_docs": [],
+    "last_tc_id": 3000, "ocr_warnings": [], "llm_used": "",
+    "feature_name": "Feature",
 }
 for k, v in DEFAULTS.items():
     if k not in st.session_state:
@@ -281,21 +269,20 @@ for k, v in DEFAULTS.items():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# OCR
+# OCR & TEXT EXTRACTION
 # ══════════════════════════════════════════════════════════════════════════════
 def run_ocr(image: Image.Image) -> tuple:
     def try_ocr(img, cfg):
         try:
             t = pytesseract.image_to_string(img, config=cfg).strip()
             return t if len(t) > 30 else ""
-        except Exception:
-            return ""
+        except Exception: return ""
     img = image.convert("RGB")
     w, h = img.size
     if w < 1000:
         img = img.resize((1000, int(h * 1000 / w)), Image.LANCZOS)
-    img  = ImageEnhance.Contrast(img).enhance(2.0)
-    img  = ImageEnhance.Sharpness(img).enhance(2.0)
+    img = ImageEnhance.Contrast(img).enhance(2.0)
+    img = ImageEnhance.Sharpness(img).enhance(2.0)
     gray = img.convert("L")
     for cfg in ["--psm 6 --oem 3", "--psm 11", "--psm 3"]:
         t = try_ocr(gray, cfg)
@@ -312,13 +299,12 @@ def extract_docx_text(file_bytes: bytes) -> str:
             xml = z.read("word/document.xml")
         NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
         tree = ET.fromstring(xml)
-        paras = []
-        for p in tree.iter(f"{{{NS}}}p"):
-            t = "".join(n.text or "" for n in p.iter(f"{{{NS}}}t"))
-            if t.strip(): paras.append(t.strip())
-        return "\n".join(paras)
-    except Exception:
-        return ""
+        return "\n".join(
+            "".join(n.text or "" for n in p.iter(f"{{{NS}}}t")).strip()
+            for p in tree.iter(f"{{{NS}}}p")
+            if "".join(n.text or "" for n in p.iter(f"{{{NS}}}t")).strip()
+        )
+    except Exception: return ""
 
 
 def extract_txt_text(file_bytes: bytes) -> str:
@@ -348,7 +334,9 @@ def load_excel_to_rag(excel_bytes: bytes) -> tuple:
             emb = embed.encode(row_text).tolist()
             try: store.add([row_text], [emb], [f"tc_{sname}_{total}"]); total += 1
             except Exception: pass
-    st.session_state.rag_count = total; st.session_state.rag_loaded = True; st.session_state.last_tc_id = last_id
+    st.session_state.rag_count = total
+    st.session_state.rag_loaded = True
+    st.session_state.last_tc_id = last_id
     return total, last_id
 
 
@@ -360,10 +348,9 @@ def rag_retrieve(query: str) -> str:
             try: store.add([doc], [emb], [f"tc_r_{i}"])
             except Exception: pass
     if store.count() == 0: return "No past test cases loaded."
-    emb = embed.encode(query[:300]).tolist()
+    emb = embed.encode(query[:200]).tolist()
     results = store.query([emb], n_results=min(3, store.count()))
     docs = results["documents"][0] if results["documents"] else []
-    # Cap RAG context strictly to prevent token overflow
     combined = "\n---\n".join(docs) if docs else "No similar cases found."
     return combined[:500]
 
@@ -376,7 +363,8 @@ def parse_json_response(raw: str) -> list:
         lambda s: json.loads(s),
         lambda s: json.loads(re.search(r'\[[\s\S]*\]', s).group()),
         lambda s: json.loads(re.sub(r'```json|```', '', s).strip()),
-        lambda s: json.loads(re.search(r'\[[\s\S]*\]', re.sub(r',\s*([}\]])', r'\1', re.sub(r"'", '"', s))).group()),
+        lambda s: json.loads(re.search(r'\[[\s\S]*\]',
+            re.sub(r',\s*([}\]])', r'\1', re.sub(r"'", '"', s))).group()),
     ]:
         try:
             r = fn(raw)
@@ -386,104 +374,71 @@ def parse_json_response(raw: str) -> list:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# GENERATE TEST CASES — with safe, compact prompts
+# GENERATE TEST CASES
 # ══════════════════════════════════════════════════════════════════════════════
 def generate_test_cases(combined_text, feature_understand, similar_cases,
                         num_cases, auto_mode, last_tc_id,
                         api_key, provider_config, include_neg, include_edge) -> list:
 
     start_id = last_tc_id + 1
-
     if auto_mode:
-        target_count = 20
-        type_rule    = "40% Positive, 35% Negative, 25% Edge."
+        target = 15; type_rule = "40% Positive, 35% Negative, 25% Edge"
     else:
-        target_count = num_cases
+        target = num_cases
         if include_neg and include_edge:
-            pos = num_cases // 3 + (num_cases % 3); neg = num_cases // 3; edge = num_cases - pos - neg
+            p = num_cases//3 + num_cases%3; n = num_cases//3; e = num_cases-p-n
         elif include_neg:
-            pos = num_cases // 2 + (num_cases % 2); neg = num_cases - pos; edge = 0
+            p = num_cases//2 + num_cases%2; n = num_cases-p; e = 0
         elif include_edge:
-            pos = num_cases // 2 + (num_cases % 2); neg = 0; edge = num_cases - pos
+            p = num_cases//2 + num_cases%2; n = 0; e = num_cases-p
         else:
-            pos, neg, edge = num_cases, 0, 0
-        type_rule = f"{pos} Positive + {neg} Negative + {edge} Edge."
+            p, n, e = num_cases, 0, 0
+        type_rule = f"{p} Positive + {n} Negative + {e} Edge"
 
-    # ── Keep ALL inputs SHORT — critical for 8K context models ──
-    fu  = (feature_understand or "")[:350]
-    ct  = (combined_text or "")[:300]
-    rag = (similar_cases or "")[:300]
+    fu  = (feature_understand or "")[:300]
+    ct  = (combined_text or "")[:250]
+    rag = (similar_cases or "")[:250]
 
-    prompt = f"""You are a QA Architect. Generate {target_count} test cases as JSON array.
-Types: {type_rule}. IDs start TC-{start_id:04d}.
+    prompt = f"""Generate {target} QA test cases as JSON array.
+Types: {type_rule}. IDs from TC-{start_id:04d}.
+Feature: {fu}
+Past cases: {rag}
+Keys: id, title, prerequisites, steps, expected, type(Positive/Negative/Edge), priority(High/Medium/Low), related_tc(None).
+Return ONLY JSON array. No other text.
+Test: {ct}"""
 
-FEATURE:
-{fu}
-
-PAST CASES:
-{rag}
-
-Keys per object: id, title, prerequisites, steps, expected, type(Positive/Negative/Edge), priority(High/Medium/Low), related_tc(None)
-Return ONLY valid JSON array. No text before [ or after ].
-
-Feature to test: {ct}"""
-
-    # ── Attempt 1 ──
+    # Attempt 1
     try:
         raw = call_llm(prompt, api_key, provider_config, max_tokens=2500)
-        result = parse_json_response(raw)
-        if result:
-            return result
+        r = parse_json_response(raw)
+        if r: return r
     except Exception as e:
-        st.warning(f"⚠️ Attempt 1 failed: {str(e)[:120]}. Retrying with shorter prompt...")
+        st.warning(f"⚠️ Attempt 1: {str(e)[:150]}. Retrying...")
 
-    # ── Attempt 2 — much simpler prompt ──
-    simple_count = min(target_count, 8)
-    simple = f"""Generate {simple_count} QA test cases as JSON array.
+    # Attempt 2
+    s2 = f"""Generate {min(target,8)} QA test cases as JSON array.
 Feature: {ct[:200]}
-Keys: id(TC-{start_id:04d}+), title, prerequisites, steps, expected, type(Positive/Negative/Edge), priority(High/Medium/Low), related_tc(None).
-Return ONLY JSON array starting with ["""
-
+Keys: id(TC-{start_id:04d}+), title, prerequisites, steps, expected, type, priority, related_tc.
+["""
     try:
-        raw = call_llm(simple, api_key, provider_config, max_tokens=2000)
-        if not raw.strip().startswith("["):
-            raw = "[" + raw
-        result = parse_json_response(raw)
-        if result:
-            return result
+        raw = call_llm(s2, api_key, provider_config, max_tokens=2000)
+        if not raw.strip().startswith("["): raw = "[" + raw
+        r = parse_json_response(raw)
+        if r: return r
     except Exception as e:
-        st.warning(f"⚠️ Attempt 2 failed: {str(e)[:120]}. Trying minimal prompt...")
+        st.warning(f"⚠️ Attempt 2: {str(e)[:150]}. Minimal retry...")
 
-    # ── Attempt 3 — ultra minimal ──
-    ultra = f"""Create 5 QA test cases as JSON array for: {ct[:120]}
+    # Attempt 3
+    s3 = f"""Create 5 test cases JSON for: {ct[:120]}
 Keys: id(TC-{start_id:04d}+), title, prerequisites, steps, expected, type, priority, related_tc
 ["""
-
     try:
-        raw = call_llm(ultra, api_key, provider_config, max_tokens=1500)
-        if not raw.strip().startswith("["):
-            raw = "[" + raw
-        result = parse_json_response(raw)
-        if result:
-            return result
+        raw = call_llm(s3, api_key, provider_config, max_tokens=1500)
+        if not raw.strip().startswith("["): raw = "[" + raw
+        r = parse_json_response(raw)
+        if r: return r
     except Exception as e:
-        st.warning(f"⚠️ Attempt 2 failed: {str(e)[:120]}. Trying minimal prompt...")
-
-    # ── Attempt 3 — ultra minimal ──
-    ultra = f"""Create 5 QA test cases as JSON array for: {ct[:150]}
-Keys: id(TC-{start_id:04d}+), title, prerequisites, steps, expected, type(Positive/Negative/Edge), priority(High/Medium/Low), related_tc(None)
-["""
-
-    try:
-        raw = call_llm(ultra, api_key, provider_config, max_tokens=2000)
-        if not raw.strip().startswith("["):
-            raw = "[" + raw
-        result = parse_json_response(raw)
-        if result:
-            return result
-    except Exception as e:
-        st.error(f"❌ All 3 attempts failed. Last error: {str(e)[:150]}")
-
+        st.error(f"❌ All attempts failed: {str(e)[:200]}")
     return []
 
 
@@ -491,74 +446,62 @@ Keys: id(TC-{start_id:04d}+), title, prerequisites, steps, expected, type(Positi
 # EXCEL BUILDER
 # ══════════════════════════════════════════════════════════════════════════════
 def build_excel(test_cases: list, feature_name: str) -> bytes:
-    wb     = openpyxl.Workbook()
+    wb = openpyxl.Workbook()
     h_fill = PatternFill("solid", fgColor="1A1A2E")
     h_font = Font(bold=True, color="E8F4FD", name="Calibri", size=11)
-    ca     = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    la     = Alignment(horizontal="left",   vertical="top",   wrap_text=True)
-    thin   = Side(style="thin", color="CCCCCC")
-    bdr    = Border(left=thin, right=thin, top=thin, bottom=thin)
+    ca = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    la = Alignment(horizontal="left", vertical="top", wrap_text=True)
+    thin = Side(style="thin", color="CCCCCC")
+    bdr = Border(left=thin, right=thin, top=thin, bottom=thin)
 
-    pos_c  = sum(1 for t in test_cases if "positive" in str(t.get("type", "")).lower())
-    neg_c  = sum(1 for t in test_cases if "negative" in str(t.get("type", "")).lower())
-    edge_c = sum(1 for t in test_cases if "edge"     in str(t.get("type", "")).lower())
+    pos_c  = sum(1 for t in test_cases if "positive" in str(t.get("type","")).lower())
+    neg_c  = sum(1 for t in test_cases if "negative" in str(t.get("type","")).lower())
+    edge_c = sum(1 for t in test_cases if "edge"     in str(t.get("type","")).lower())
 
     # SUMMARY
     ws_s = wb.active; ws_s.title = "SUMMARY"
-    for c, h in enumerate(["Feature / Module Name", "Total Test Cases", "Positive Count",
-                            "Negative Count", "Edge Case Count", "ACs Covered", "Gaps"], 1):
+    for c, h in enumerate(["Feature","Total","Positive","Negative","Edge","ACs","Gaps"], 1):
         cell = ws_s.cell(row=1, column=c, value=h)
         cell.fill = h_fill; cell.font = h_font; cell.alignment = ca
         ws_s.column_dimensions[get_column_letter(c)].width = 22
-    ws_s.cell(row=2, column=1, value=feature_name)
-    ws_s.cell(row=2, column=2, value=len(test_cases))
-    ws_s.cell(row=2, column=3, value=pos_c)
-    ws_s.cell(row=2, column=4, value=neg_c)
-    ws_s.cell(row=2, column=5, value=edge_c)
-    ws_s.cell(row=2, column=6, value="Extracted from feature input")
-    ws_s.cell(row=2, column=7, value="Legacy integration, Performance")
+    ws_s.cell(row=2,column=1,value=feature_name)
+    ws_s.cell(row=2,column=2,value=len(test_cases))
+    ws_s.cell(row=2,column=3,value=pos_c)
+    ws_s.cell(row=2,column=4,value=neg_c)
+    ws_s.cell(row=2,column=5,value=edge_c)
+    ws_s.cell(row=2,column=6,value="From feature input")
+    ws_s.cell(row=2,column=7,value="Legacy, Performance")
     ws_s.freeze_panes = "A2"
 
     # TEST CASES
     ws = wb.create_sheet(title=safe_sheet_name(feature_name, "TestCases"))
-
-    hdrs   = ["Test Case ID", "Test Case Title", "Prerequisites", "Test Steps",
-              "Expected Result", "Test Type", "Priority", "Related TC ID"]
+    hdrs = ["Test Case ID","Title","Prerequisites","Steps","Expected","Type","Priority","Related TC"]
     widths = [14, 35, 32, 55, 42, 12, 10, 14]
-    fills  = {
-        "pos" : PatternFill("solid", fgColor="E2EFDA"),
-        "posa": PatternFill("solid", fgColor="D0E8C5"),
-        "neg" : PatternFill("solid", fgColor="FCE4D6"),
-        "nega": PatternFill("solid", fgColor="F0D0B8"),
-        "edg" : PatternFill("solid", fgColor="FFF2CC"),
-        "edga": PatternFill("solid", fgColor="EFE8AA"),
+    fills = {
+        "pos": PatternFill("solid", fgColor="E2EFDA"), "posa": PatternFill("solid", fgColor="D0E8C5"),
+        "neg": PatternFill("solid", fgColor="FCE4D6"), "nega": PatternFill("solid", fgColor="F0D0B8"),
+        "edg": PatternFill("solid", fgColor="FFF2CC"), "edga": PatternFill("solid", fgColor="EFE8AA"),
     }
-
     for c, (h, w) in enumerate(zip(hdrs, widths), 1):
         cell = ws.cell(row=1, column=c, value=h)
         cell.fill = h_fill; cell.font = h_font; cell.alignment = ca; cell.border = bdr
         ws.column_dimensions[get_column_letter(c)].width = w
-    ws.row_dimensions[1].height = 30
-    ws.freeze_panes = "A2"
+    ws.row_dimensions[1].height = 30; ws.freeze_panes = "A2"
 
     for ri, tc in enumerate(test_cases, 2):
-        t = str(tc.get("type", "")).lower(); alt = ri % 2 == 0
-        if "negative" in t:   fill = fills["nega"] if alt else fills["neg"]
-        elif "edge"   in t:   fill = fills["edga"] if alt else fills["edg"]
-        else:                 fill = fills["posa"] if alt else fills["pos"]
-
-        # Safely convert steps to string
-        steps_val = tc.get("steps", "")
-        if isinstance(steps_val, list):
-            steps_val = "\n".join(str(s) for s in steps_val)
-
-        vals = [tc.get("id", f"TC-{3000+ri:04d}"), tc.get("title", ""),
-                tc.get("prerequisites", ""), steps_val, tc.get("expected", ""),
-                tc.get("type", "Positive"), tc.get("priority", "Medium"), tc.get("related_tc", "None")]
+        t = str(tc.get("type","")).lower(); alt = ri % 2 == 0
+        if "negative" in t: fill = fills["nega"] if alt else fills["neg"]
+        elif "edge" in t:   fill = fills["edga"] if alt else fills["edg"]
+        else:               fill = fills["posa"] if alt else fills["pos"]
+        steps = tc.get("steps", "")
+        if isinstance(steps, list): steps = "\n".join(str(s) for s in steps)
+        vals = [tc.get("id", f"TC-{3000+ri:04d}"), tc.get("title",""),
+                tc.get("prerequisites",""), steps, tc.get("expected",""),
+                tc.get("type","Positive"), tc.get("priority","Medium"), tc.get("related_tc","None")]
         for ci, val in enumerate(vals, 1):
             cell = ws.cell(row=ri, column=ci, value=str(val) if val is not None else "")
             cell.font = Font(name="Calibri", size=10); cell.border = bdr; cell.fill = fill
-            cell.alignment = ca if ci in [1, 6, 7, 8] else la
+            cell.alignment = ca if ci in [1,6,7,8] else la
         ws.row_dimensions[ri].height = 80
 
     buf = io.BytesIO(); wb.save(buf); return buf.getvalue()
@@ -592,7 +535,7 @@ with st.sidebar:
     st.markdown('<div class="sidebar-section">', unsafe_allow_html=True)
     st.markdown('<div class="sidebar-title">📊 Existing Test Cases (RAG)</div>', unsafe_allow_html=True)
     st.caption("Upload master Excel → avoids duplicates")
-    past_excel = st.file_uploader("Upload existing test cases", type=["xlsx", "xls"], label_visibility="hidden")
+    past_excel = st.file_uploader("Upload existing test cases", type=["xlsx","xls"], label_visibility="hidden")
     if past_excel and not st.session_state.rag_loaded:
         with st.spinner("Loading into RAG..."):
             count, last_id = load_excel_to_rag(past_excel.read())
@@ -613,37 +556,37 @@ with st.sidebar:
     auto_mode = st.toggle("🤖 Auto — generate ALL scenarios", value=False)
     if auto_mode:
         num_cases = 999
-        st.markdown('<div class="info-box">AI generates 20-30 TCs for full coverage</div>', unsafe_allow_html=True)
+        st.markdown('<div class="info-box">AI generates 15-20 TCs for full coverage</div>', unsafe_allow_html=True)
     else:
         num_cases = st.number_input("Number of test cases", min_value=5, max_value=100, value=15, step=5)
     include_neg  = st.toggle("Include negative tests", value=True)
-    include_edge = st.toggle("Include edge cases",     value=True)
+    include_edge = st.toggle("Include edge cases", value=True)
     st.markdown('</div>', unsafe_allow_html=True)
 
     st.markdown("---")
     st.markdown('<div class="sidebar-title">📋 Pipeline Status</div>', unsafe_allow_html=True)
     stage = st.session_state.stage or 0
-    for i, label in enumerate(["🔍 Extract Text", "🧠 Parse Feature", "📚 RAG Search", "⚙️ Generate JSON", "📊 Build Excel"]):
+    for i, label in enumerate(["🔍 Extract Text","🧠 Parse Feature","📚 RAG Search","⚙️ Generate JSON","📊 Build Excel"]):
         color = "#2E7D32" if i < stage else ("#1565C0" if i == stage and stage > 0 else "#9B8EA0")
-        icon  = "✅"      if i < stage else ("⏳"      if i == stage and stage > 0 else "○")
+        icon  = "✅" if i < stage else ("⏳" if i == stage and stage > 0 else "○")
         st.markdown(f'<div style="color:{color};font-size:0.85rem;padding:0.2rem 0;">{icon} {label}</div>', unsafe_allow_html=True)
 
-col_left, col_right = st.columns([1, 1], gap="large")
+col_left, col_right = st.columns([1,1], gap="large")
 
 with col_left:
     st.markdown('<div class="card-label">📤 Feature Input</div>', unsafe_allow_html=True)
-    tab_img, tab_doc, tab_txt = st.tabs(["🖼️ Images", "📄 Documents", "📝 Text / Jira Story"])
+    tab_img, tab_doc, tab_txt = st.tabs(["🖼️ Images","📄 Documents","📝 Text / Jira Story"])
 
     with tab_img:
         st.markdown('<div class="info-box">💡 If OCR fails, paste text in the Text tab.</div>', unsafe_allow_html=True)
-        images = st.file_uploader("Upload feature images", type=["jpg", "jpeg", "png", "webp", "bmp"],
+        images = st.file_uploader("Upload feature images", type=["jpg","jpeg","png","webp","bmp"],
                                   accept_multiple_files=True, label_visibility="hidden")
         if images:
             for img in images: st.image(img, caption=img.name, use_container_width=True)
 
     with tab_doc:
         st.markdown('<div class="info-box">💡 Supports .docx and .txt files.</div>', unsafe_allow_html=True)
-        doc_files = st.file_uploader("Upload .docx or .txt", type=["docx", "txt"],
+        doc_files = st.file_uploader("Upload .docx or .txt", type=["docx","txt"],
                                      accept_multiple_files=True, label_visibility="hidden")
 
     with tab_txt:
@@ -656,11 +599,10 @@ with col_left:
     if vd_link:
         st.markdown('<div class="warn-box">⚠️ Open the link, copy text (Ctrl+A → Ctrl+C), paste in Text tab.</div>', unsafe_allow_html=True)
 
-    has_image = bool(images)
-    has_doc   = bool(doc_files)
-    has_text  = bool(manual_text and manual_text.strip())
+    has_image = bool(images); has_doc = bool(doc_files)
+    has_text = bool(manual_text and manual_text.strip())
     has_input = has_image or has_doc or has_text
-    can_run   = has_input and bool(api_key)
+    can_run = has_input and bool(api_key)
 
     if not api_key:     st.caption("🔑 Add your API key in the sidebar")
     elif not has_input: st.caption("⬆️ Upload images, documents, or paste text above")
@@ -675,17 +617,16 @@ with col_left:
                 for img_file in images:
                     text, warns = run_ocr(Image.open(img_file))
                     ocr_warnings.extend(warns)
-                    combined_text += (f"\n\n[Image: {img_file.name}]\n{text}" if text else "")
-                    if not text: ocr_warnings.append(f"⚠️ No text from '{img_file.name}'.")
+                    if text: combined_text += f"\n\n[Image: {img_file.name}]\n{text}"
+                    else: ocr_warnings.append(f"⚠️ No text from '{img_file.name}'.")
 
         if has_doc:
             with st.spinner("📄 Reading documents..."):
                 for df in doc_files:
                     raw = df.read()
-                    text = (extract_docx_text(raw) if df.name.endswith(".docx")
-                            else extract_txt_text(raw))
-                    combined_text += (f"\n\n[Doc: {df.name}]\n{text}" if text else "")
-                    if not text: ocr_warnings.append(f"⚠️ Could not extract from '{df.name}'.")
+                    text = extract_docx_text(raw) if df.name.endswith(".docx") else extract_txt_text(raw)
+                    if text: combined_text += f"\n\n[Doc: {df.name}]\n{text}"
+                    else: ocr_warnings.append(f"⚠️ Could not extract from '{df.name}'.")
 
         if has_text:
             combined_text += f"\n\n[Feature Description]\n{manual_text.strip()}"
@@ -695,30 +636,26 @@ with col_left:
 
         if not combined_text:
             st.error("❌ No text extracted. Please paste content in the Text tab."); st.stop()
-
         st.session_state.extracted_text = combined_text
 
-        # Determine feature name
         feature_name = "Feature"
         if images:      feature_name = os.path.splitext(images[0].name)[0]
         elif doc_files: feature_name = os.path.splitext(doc_files[0].name)[0]
         elif manual_text:
             fl = manual_text.strip().split("\n")[0]
-            feature_name = fl[:50].replace("Feature:", "").strip() or "Feature"
+            feature_name = fl[:50].replace("Feature:","").strip() or "Feature"
         st.session_state.feature_name = feature_name
 
-        # Stage 2 — Feature understanding with SHORT input
+        # Stage 2
         st.session_state.stage = 2
         with st.spinner("🧠 Parsing feature..."):
-            fu_prompt = f"""Parse this feature. List: Feature Name, User Roles, Screens, UI Components, Acceptance Criteria, Business Rules, Error States.
-
-Input:
-{combined_text[:500]}"""
+            fu_prompt = f"""List Feature Name, User Roles, Screens, UI Components, Acceptance Criteria, Business Rules, Error States for:
+{combined_text[:400]}"""
             try:
                 feature_understand = call_llm(fu_prompt, api_key, provider_cfg, max_tokens=400)
             except Exception as e:
-                feature_understand = f"Feature Name: {feature_name}\nInput summary: {combined_text[:200]}"
-                st.warning(f"⚠️ Feature parsing error: {str(e)[:80]}. Using raw input.")
+                feature_understand = f"Feature: {feature_name}\n{combined_text[:200]}"
+                st.warning(f"⚠️ Feature parse error: {str(e)[:80]}. Using raw input.")
             st.session_state.feature_understand = feature_understand
 
         # Stage 3
@@ -738,21 +675,19 @@ Input:
             )
             if not test_cases:
                 st.error("❌ Could not generate test cases.\n\n"
-                         "**Try:** Switch AI model in sidebar, reduce test case count, or wait 30s and retry.")
+                         "**Try:** Switch AI model in sidebar, reduce count, or wait 30s.")
                 st.stop()
             st.session_state.test_cases_parsed = test_cases
             st.session_state.tc_count   = len(test_cases)
-            st.session_state.pos_count  = sum(1 for t in test_cases if "positive" in t.get("type", "").lower())
-            st.session_state.neg_count  = sum(1 for t in test_cases if "negative" in t.get("type", "").lower())
-            st.session_state.edge_count = sum(1 for t in test_cases if "edge"     in t.get("type", "").lower())
+            st.session_state.pos_count  = sum(1 for t in test_cases if "positive" in t.get("type","").lower())
+            st.session_state.neg_count  = sum(1 for t in test_cases if "negative" in t.get("type","").lower())
+            st.session_state.edge_count = sum(1 for t in test_cases if "edge" in t.get("type","").lower())
             st.session_state.llm_used   = selected_llm
 
         # Stage 5
         st.session_state.stage = 5
         with st.spinner("📊 Building Excel..."):
-            excel = build_excel(test_cases, feature_name)
-            st.session_state.excel_bytes = excel
-
+            st.session_state.excel_bytes = build_excel(test_cases, feature_name)
         st.rerun()
 
 with col_right:
@@ -779,15 +714,15 @@ with col_right:
             <div class="metric"><div class="metric-val">{rag}</div><div class="metric-lbl">📚 RAG</div></div>
         </div>""", unsafe_allow_html=True)
 
-        t1, t2, t3 = st.tabs(["📊 Test Cases", "🧠 Feature Understanding", "🔍 Extracted Text"])
+        t1, t2, t3 = st.tabs(["📊 Test Cases","🧠 Feature Understanding","🔍 Extracted Text"])
         with t1:
             tcs = st.session_state.test_cases_parsed
             preview = "\n\n".join(
-                f"{t.get('id', '')} | {t.get('type', '')} | {t.get('priority', '')}\n"
-                f"Title: {t.get('title', '')}\nPrerequisites: {t.get('prerequisites', '')}\n"
-                f"Steps:\n{t.get('steps', '')}\nExpected: {t.get('expected', '')}"
+                f"{t.get('id','')} | {t.get('type','')} | {t.get('priority','')}\n"
+                f"Title: {t.get('title','')}\nPrereq: {t.get('prerequisites','')}\n"
+                f"Steps:\n{t.get('steps','')}\nExpected: {t.get('expected','')}"
                 for t in tcs[:5])
-            if len(tcs) > 5: preview += f"\n\n... and {len(tcs)-5} more in the Excel file"
+            if len(tcs) > 5: preview += f"\n\n... +{len(tcs)-5} more in Excel"
             st.markdown(f'<div class="result-preview">{preview}</div>', unsafe_allow_html=True)
         with t2:
             st.markdown(f'<div class="result-preview">{st.session_state.feature_understand or "—"}</div>', unsafe_allow_html=True)
@@ -803,7 +738,7 @@ with col_right:
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
         if st.button("🔄 Generate New"):
-            for k in ["extracted_text", "feature_understand", "test_cases_parsed", "excel_bytes",
-                      "tc_count", "pos_count", "neg_count", "edge_count", "ocr_warnings", "llm_used", "feature_name"]:
-                st.session_state[k] = [] if k in ["test_cases_parsed", "ocr_warnings"] else None
+            for k in ["extracted_text","feature_understand","test_cases_parsed","excel_bytes",
+                      "tc_count","pos_count","neg_count","edge_count","ocr_warnings","llm_used","feature_name"]:
+                st.session_state[k] = [] if k in ["test_cases_parsed","ocr_warnings"] else None
             st.session_state.stage = 0; st.rerun()
