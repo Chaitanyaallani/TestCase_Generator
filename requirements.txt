@@ -4,4 +4,3 @@ Pillow
 openpyxl
 sentence-transformers
 requests
-tesseract-ocr
